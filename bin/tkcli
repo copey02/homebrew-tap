@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""
+Tracker CLI - Search and download torrents from private trackers
+Supports: Beyond-HD, Hawke.uno (UNIT3D)
+"""
+
+import argparse
+import json
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "trackers" / "config.json"
+
+# Resolution mappings for each tracker
+BHD_TYPES = {
+    "2160p": "UHD 100",
+    "4k": "UHD 100",
+    "1080p": "BD Remux",
+    "720p": "720p",
+}
+
+UNIT3D_RESOLUTIONS = {
+    "2160p": "2",
+    "4k": "2",
+    "1080p": "3",
+    "720p": "5",
+}
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config file not found at {CONFIG_PATH}")
+        print("Create it with tracker configs. See --help for format.")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def format_size(bytes_val):
+    try:
+        gb = int(bytes_val) / 1024 / 1024 / 1024
+        if gb >= 1:
+            return f"{gb:.1f} GB"
+        mb = int(bytes_val) / 1024 / 1024
+        return f"{mb:.0f} MB"
+    except (ValueError, TypeError):
+        return "? GB"
+
+
+def bhd_search(query, config, limit=50, resolution=None):
+    """Search Beyond-HD API"""
+    tracker = config["trackers"]["bhd"]
+    url = f"{tracker['url']}/api/torrents/{tracker['api_key']}"
+
+    body = {
+        "action": "search",
+        "rsskey": tracker["rss_key"],
+        "search": query,
+    }
+
+    if resolution and resolution in BHD_TYPES:
+        body["types"] = [BHD_TYPES[resolution]]
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"BHD API Error: {e}")
+        return []
+
+    if result.get("status_code") != 1:
+        print(f"BHD Error: {result.get('status_message', 'Unknown error')}")
+        return []
+
+    results = []
+    for item in result.get("Results", [])[:limit]:
+        results.append({
+            "tracker": "BHD",
+            "name": item.get("Name", ""),
+            "size": item.get("Size", 0),
+            "seeders": item.get("Seeders", 0),
+            "leechers": item.get("Leechers", 0),
+            "download_url": item.get("download_url", ""),
+            "page_url": item.get("url", ""),
+            "freeleech": item.get("Freeleech", False),
+            "internal": item.get("Internal", False),
+            "created_at": item.get("created_at", ""),
+        })
+
+    return results
+
+
+def unit3d_search(query, config, tracker_name, limit=50, resolution=None):
+    """Search UNIT3D-based tracker (Hawke, etc.)"""
+    tracker = config["trackers"][tracker_name]
+    base_url = tracker["url"].rstrip("/")
+
+    params = {
+        "name": query,
+        "perPage": limit,
+    }
+
+    if resolution and resolution in UNIT3D_RESOLUTIONS:
+        params["resolutions[]"] = UNIT3D_RESOLUTIONS[resolution]
+
+    url = f"{base_url}/api/torrents/filter?{urllib.parse.urlencode(params)}"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {tracker['api_key']}",
+            "Accept": "application/json",
+        },
+        method="GET"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"{tracker_name.upper()} API Error: {e.code} {e.reason}")
+        return []
+    except Exception as e:
+        print(f"{tracker_name.upper()} API Error: {e}")
+        return []
+
+    results = []
+    for item in result.get("data", []):
+        attrs = item.get("attributes", item)
+        results.append({
+            "tracker": tracker_name.upper(),
+            "id": item.get("id") or attrs.get("id"),
+            "name": attrs.get("name", ""),
+            "size": attrs.get("size", 0),
+            "seeders": attrs.get("seeders", 0),
+            "leechers": attrs.get("leechers", 0),
+            "download_url": f"{base_url}/torrent/download/{item.get('id')}/{tracker['rss_key']}",
+            "page_url": f"{base_url}/torrents/{item.get('id')}",
+            "freeleech": attrs.get("freeleech", False) or attrs.get("free", "0%") != "0%",
+            "internal": attrs.get("internal", False),
+            "created_at": attrs.get("created_at", ""),
+        })
+
+    return results
+
+
+def search(args, config):
+    query = args.query
+    resolution = config.get("default_resolution", "1080p")
+
+    if args.resolution:
+        resolution = args.resolution
+    elif args.no_default_res:
+        resolution = None
+
+    all_results = []
+
+    # Determine which trackers to search
+    trackers_to_search = []
+    if args.tracker:
+        trackers_to_search = [args.tracker.lower()]
+    else:
+        trackers_to_search = list(config.get("trackers", {}).keys())
+
+    for tracker_name in trackers_to_search:
+        if tracker_name not in config.get("trackers", {}):
+            print(f"Warning: Tracker '{tracker_name}' not configured")
+            continue
+
+        tracker = config["trackers"][tracker_name]
+        tracker_type = tracker.get("type", "unit3d")
+
+        if tracker_type == "bhd":
+            results = bhd_search(query, config, args.limit, resolution)
+        else:
+            results = unit3d_search(query, config, tracker_name, args.limit, resolution)
+
+        all_results.extend(results)
+
+    if not all_results:
+        print("No results found")
+        return
+
+    # Sort by seeders descending
+    all_results.sort(key=lambda x: x["seeders"], reverse=True)
+
+    # Print results
+    print(f"\n{'#':<3} {'Tracker':<6} {'Name':<65} {'Size':>8} {'S':>4} {'L':>4}")
+    print("-" * 95)
+
+    for i, item in enumerate(all_results[:args.limit], 1):
+        name = item["name"][:64]
+        size = format_size(item["size"])
+        flags = ""
+        if item.get("freeleech"):
+            flags += " [FL]"
+        if item.get("internal"):
+            flags += " [INT]"
+
+        print(f"{i:<3} {item['tracker']:<6} {name:<65} {size:>8} {item['seeders']:>4} {item['leechers']:>4}{flags}")
+
+    if args.show_urls:
+        print("\nDownload URLs:")
+        for i, item in enumerate(all_results[:args.limit], 1):
+            print(f"  {i}: {item['download_url']}")
+
+
+def get(args, config):
+    """Download a torrent file by number from last search or direct URL"""
+    import tempfile
+    import os
+
+    url = args.url_or_num
+    output_dir = Path(args.output or config.get("default_download_path", "."))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine tracker from URL for auth headers
+    headers = {}
+    for tracker_name, tracker in config.get("trackers", {}).items():
+        if tracker["url"] in url:
+            if tracker.get("type") != "bhd":
+                headers["Authorization"] = f"Bearer {tracker['api_key']}"
+            break
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+
+            # Try to get filename from Content-Disposition
+            cd = resp.headers.get("Content-Disposition", "")
+            filename = None
+            if "filename=" in cd:
+                import re
+                match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+                if match:
+                    filename = match.group(1).strip()
+
+            if not filename:
+                filename = "download.torrent"
+
+            output_path = output_dir / filename
+            with open(output_path, "wb") as f:
+                f.write(content)
+
+            size = output_path.stat().st_size / 1024
+            print(f"Downloaded: {filename}")
+            print(f"Size: {size:.1f} KB")
+            print(f"Path: {output_path}")
+
+            # Optionally add to Transmission
+            if args.add_to_tm:
+                add_to_transmission(output_path, config)
+
+    except Exception as e:
+        print(f"Download error: {e}")
+        sys.exit(1)
+
+
+def add_to_transmission(torrent_path, config):
+    """Add torrent to Transmission via RPC"""
+    import base64
+
+    tm_config_path = Path.home() / ".config" / "transmission" / "config.json"
+    if not tm_config_path.exists():
+        print("Warning: Transmission config not found, skipping add")
+        return
+
+    with open(tm_config_path) as f:
+        tm_config = json.load(f)
+
+    with open(torrent_path, "rb") as f:
+        torrent_data = base64.b64encode(f.read()).decode()
+
+    url = tm_config["url"]
+    auth_header = None
+    if tm_config.get("username") and tm_config.get("password"):
+        import base64
+        creds = f"{tm_config['username']}:{tm_config['password']}"
+        auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
+
+    # Get session ID first
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    session_id = None
+    try:
+        req = urllib.request.Request(url, headers=headers, method="POST", data=b"{}")
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            session_id = e.headers.get("X-Transmission-Session-Id")
+        else:
+            print(f"Transmission error: {e}")
+            return
+
+    if session_id:
+        headers["X-Transmission-Session-Id"] = session_id
+
+    body = json.dumps({
+        "method": "torrent-add",
+        "arguments": {"metainfo": torrent_data}
+    }).encode()
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="POST", data=body)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("result") == "success":
+                added = result.get("arguments", {}).get("torrent-added", {})
+                name = added.get("name", "Unknown")
+                print(f"Added to Transmission: {name}")
+            else:
+                print(f"Transmission error: {result.get('result', 'Unknown error')}")
+    except Exception as e:
+        print(f"Transmission error: {e}")
+
+
+def recent(args, config):
+    """Show recent uploads from trackers"""
+    resolution = config.get("default_resolution", "1080p")
+    if args.no_default_res:
+        resolution = None
+
+    all_results = []
+
+    trackers_to_search = []
+    if args.tracker:
+        trackers_to_search = [args.tracker.lower()]
+    else:
+        trackers_to_search = list(config.get("trackers", {}).keys())
+
+    for tracker_name in trackers_to_search:
+        if tracker_name not in config.get("trackers", {}):
+            continue
+
+        tracker = config["trackers"][tracker_name]
+        tracker_type = tracker.get("type", "unit3d")
+
+        # Use empty query for recent
+        if tracker_type == "bhd":
+            results = bhd_search("", config, args.limit, resolution)
+        else:
+            results = unit3d_search("", config, tracker_name, args.limit, resolution)
+
+        all_results.extend(results)
+
+    if not all_results:
+        print("No results found")
+        return
+
+    # Sort by date descending (most recent first)
+    all_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+    print(f"\n{'#':<3} {'Tracker':<6} {'Name':<65} {'Size':>8} {'S':>4}")
+    print("-" * 90)
+
+    for i, item in enumerate(all_results[:args.limit], 1):
+        name = item["name"][:64]
+        size = format_size(item["size"])
+        flags = ""
+        if item.get("freeleech"):
+            flags += " [FL]"
+
+        print(f"{i:<3} {item['tracker']:<6} {name:<65} {size:>8} {item['seeders']:>4}{flags}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tracker CLI - Search private trackers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  tk search "Oppenheimer"              # Search all trackers (1080p default)
+  tk search "Oppenheimer" -t bhd       # Search Beyond-HD only
+  tk search "Oppenheimer" -t hawke     # Search Hawke only
+  tk search "Oppenheimer" -r 2160p     # Search for 4K
+  tk search "Oppenheimer" --no-default-res  # Search without resolution filter
+  tk search "Oppenheimer" --show-urls  # Show download URLs
+  tk get <url>                         # Download torrent file
+  tk get <url> --add-to-tm             # Download and add to Transmission
+  tk recent                            # Recent uploads across all trackers
+  tk recent -t bhd                     # Recent from Beyond-HD
+
+Trackers: bhd (Beyond-HD), hawke (Hawke.uno)
+Default: 1080p resolution filter applied
+
+Config file: ~/.config/trackers/config.json
+{
+  "default_resolution": "1080p",
+  "default_download_path": "~/Downloads/torrents",
+  "trackers": {
+    "bhd": {
+      "type": "bhd",
+      "url": "https://beyond-hd.me",
+      "api_key": "your-api-key",
+      "rss_key": "your-rss-key"
+    },
+    "hawke": {
+      "type": "unit3d",
+      "url": "https://hawke.uno",
+      "api_key": "your-api-token",
+      "rss_key": "your-rss-key"
+    }
+  }
+}
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Search command
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search trackers")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("-t", "--tracker", help="Specific tracker (bhd, hawke)")
+    search_p.add_argument("-r", "--resolution", help="Resolution filter (1080p, 2160p, 720p)")
+    search_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
+    search_p.add_argument("--no-default-res", action="store_true", help="Don't apply default resolution filter")
+    search_p.add_argument("--show-urls", action="store_true", help="Show download URLs")
+
+    # Get/download command
+    get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download torrent")
+    get_p.add_argument("url_or_num", help="Download URL")
+    get_p.add_argument("-o", "--output", help="Output directory")
+    get_p.add_argument("--add-to-tm", action="store_true", help="Add to Transmission after download")
+
+    # Recent command
+    recent_p = subparsers.add_parser("recent", aliases=["r"], help="Recent uploads")
+    recent_p.add_argument("-t", "--tracker", help="Specific tracker")
+    recent_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
+    recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    if args.command in ("search", "s"):
+        search(args, config)
+    elif args.command in ("get", "g", "download", "d"):
+        get(args, config)
+    elif args.command in ("recent", "r"):
+        recent(args, config)
+
+
+if __name__ == "__main__":
+    main()
