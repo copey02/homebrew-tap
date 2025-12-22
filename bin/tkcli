@@ -138,7 +138,7 @@ def unit3d_search(query, config, tracker_name, limit=50, resolution=None):
             "size": attrs.get("size", 0),
             "seeders": attrs.get("seeders", 0),
             "leechers": attrs.get("leechers", 0),
-            "download_url": f"{base_url}/torrent/download/{item.get('id')}/{tracker['rss_key']}",
+            "download_url": f"{base_url}/torrent/download/{item.get('id')}.{tracker['rss_key']}",
             "page_url": f"{base_url}/torrents/{item.get('id')}",
             "freeleech": attrs.get("freeleech", False) or attrs.get("free", "0%") != "0%",
             "internal": attrs.get("internal", False),
