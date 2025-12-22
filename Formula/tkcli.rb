@@ -2,7 +2,7 @@ class Tkcli < Formula
   desc "Tracker CLI - Search and download from private trackers (BHD, Hawke)"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/tkcli"
-  version "1.0.0"
+  version "1.0.1"
   license "MIT"
 
   depends_on "python@3"
