@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""
+Transmission CLI - Control Transmission BitTorrent client from the command line
+"""
+
+import argparse
+import json
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "transmission" / "config.json"
+
+STATUS_MAP = {
+    0: "Stopped",
+    1: "Check Queue",
+    2: "Checking",
+    3: "DL Queue",
+    4: "Downloading",
+    5: "Seed Queue",
+    6: "Seeding",
+}
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config not found at {CONFIG_PATH}")
+        print("Create it with: url, username, password")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def api_request(method, arguments, config):
+    url = config.get("url", "http://localhost:9091/transmission/rpc")
+
+    headers = {"Content-Type": "application/json"}
+
+    # Basic auth
+    if config.get("username") and config.get("password"):
+        import base64
+        creds = base64.b64encode(f"{config['username']}:{config['password']}".encode()).decode()
+        headers["Authorization"] = f"Basic {creds}"
+
+    payload = json.dumps({"method": method, "arguments": arguments}).encode()
+
+    # First request to get session ID
+    req = urllib.request.Request(url, data=payload, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # Get session ID and retry
+            session_id = e.headers.get("X-Transmission-Session-Id")
+            if session_id:
+                headers["X-Transmission-Session-Id"] = session_id
+                req = urllib.request.Request(url, data=payload, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode())
+        print(f"API Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+def format_size(bytes_val):
+    if bytes_val < 0:
+        return "-"
+    gb = bytes_val / 1024 / 1024 / 1024
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = bytes_val / 1024 / 1024
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    kb = bytes_val / 1024
+    return f"{kb:.1f} KB"
+
+def format_speed(bytes_per_sec):
+    if bytes_per_sec <= 0:
+        return "-"
+    mb = bytes_per_sec / 1024 / 1024
+    if mb >= 1:
+        return f"{mb:.1f} MB/s"
+    kb = bytes_per_sec / 1024
+    return f"{kb:.1f} KB/s"
+
+def format_eta(seconds):
+    if seconds < 0:
+        return "-"
+    if seconds == 0:
+        return "Done"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{int(hours)}h {int(minutes)}m"
+    if minutes > 0:
+        return f"{int(minutes)}m {int(secs)}s"
+    return f"{int(secs)}s"
+
+def list_cmd(args, config):
+    fields = ["id", "name", "status", "totalSize", "percentDone",
+              "rateDownload", "rateUpload", "eta", "uploadRatio", "error", "errorString"]
+
+    result = api_request("torrent-get", {"fields": fields}, config)
+    torrents = result.get("arguments", {}).get("torrents", [])
+
+    if not torrents:
+        print("No torrents")
+        return
+
+    # Apply filters
+    if args.downloading:
+        torrents = [t for t in torrents if t["status"] == 4]
+    elif args.seeding:
+        torrents = [t for t in torrents if t["status"] == 6]
+    elif args.paused:
+        torrents = [t for t in torrents if t["status"] == 0]
+    elif args.active:
+        torrents = [t for t in torrents if t["rateDownload"] > 0 or t["rateUpload"] > 0]
+
+    print(f"\n{'ID':>4} {'Name':<45} {'Size':>9} {'Done':>6} {'Status':<12} {'Down':>9} {'Up':>9}")
+    print("-" * 105)
+
+    total_down = 0
+    total_up = 0
+
+    for t in torrents:
+        name = t["name"][:44]
+        status = t["errorString"][:11] if t["error"] else STATUS_MAP.get(t["status"], "?")
+        pct = f"{t['percentDone']*100:.0f}%"
+
+        total_down += t["rateDownload"]
+        total_up += t["rateUpload"]
+
+        print(f"{t['id']:>4} {name:<45} {format_size(t['totalSize']):>9} {pct:>6} {status:<12} {format_speed(t['rateDownload']):>9} {format_speed(t['rateUpload']):>9}")
+
+    print(f"\n{len(torrents)} torrents | Down: {format_speed(total_down)} | Up: {format_speed(total_up)}")
+
+def info(args, config):
+    fields = ["id", "name", "status", "hashString", "totalSize", "percentDone",
+              "downloadedEver", "uploadedEver", "uploadRatio", "rateDownload", "rateUpload",
+              "eta", "addedDate", "doneDate", "downloadDir", "error", "errorString",
+              "peersConnected", "comment", "magnetLink"]
+
+    result = api_request("torrent-get", {"ids": [args.id], "fields": fields}, config)
+    torrents = result.get("arguments", {}).get("torrents", [])
+
+    if not torrents:
+        print(f"Torrent {args.id} not found")
+        return
+
+    t = torrents[0]
+
+    print(f"\n{t['name']}")
+    print("-" * 60)
+    print(f"ID:         {t['id']}")
+    print(f"Hash:       {t['hashString']}")
+    print(f"Status:     {STATUS_MAP.get(t['status'], '?')}")
+    print(f"Size:       {format_size(t['totalSize'])}")
+    print(f"Progress:   {t['percentDone']*100:.1f}%")
+    print(f"Downloaded: {format_size(t['downloadedEver'])}")
+    print(f"Uploaded:   {format_size(t['uploadedEver'])}")
+    print(f"Ratio:      {t['uploadRatio']:.2f}" if t['uploadRatio'] >= 0 else "Ratio:      -")
+    print(f"Down Speed: {format_speed(t['rateDownload'])}")
+    print(f"Up Speed:   {format_speed(t['rateUpload'])}")
+    print(f"ETA:        {format_eta(t['eta'])}")
+    print(f"Peers:      {t['peersConnected']}")
+    print(f"Location:   {t['downloadDir']}")
+    if t.get('comment'):
+        print(f"Comment:    {t['comment'][:60]}")
+
+    if args.magnet:
+        print(f"\nMagnet: {t['magnetLink']}")
+
+def add(args, config):
+    add_args = {}
+
+    if args.source.startswith("magnet:") or args.source.startswith("http"):
+        add_args["filename"] = args.source
+    else:
+        # Read torrent file and base64 encode
+        import base64
+        path = Path(args.source).expanduser()
+        if not path.exists():
+            print(f"File not found: {args.source}")
+            sys.exit(1)
+        with open(path, "rb") as f:
+            add_args["metainfo"] = base64.b64encode(f.read()).decode()
+
+    if args.paused:
+        add_args["paused"] = True
+
+    if args.download_dir:
+        add_args["download-dir"] = args.download_dir
+
+    result = api_request("torrent-add", add_args, config)
+    resp = result.get("arguments", {})
+
+    if "torrent-added" in resp:
+        t = resp["torrent-added"]
+        print(f"Added: {t['name']} (ID: {t['id']})")
+    elif "torrent-duplicate" in resp:
+        t = resp["torrent-duplicate"]
+        print(f"Duplicate: {t['name']} (ID: {t['id']})")
+    else:
+        print(f"Failed to add torrent")
+
+def remove(args, config):
+    result = api_request("torrent-remove", {
+        "ids": args.ids,
+        "delete-local-data": args.delete_data
+    }, config)
+
+    if result.get("result") == "success":
+        print(f"Removed {len(args.ids)} torrent(s)" + (" and data" if args.delete_data else ""))
+    else:
+        print(f"Failed: {result.get('result')}")
+
+def start(args, config):
+    ids = args.ids if args.ids != ["all"] else None
+    method = "torrent-start-now" if args.now else "torrent-start"
+    req_args = {"ids": ids} if ids else {}
+
+    result = api_request(method, req_args, config)
+    if result.get("result") == "success":
+        print(f"Started {'all torrents' if not ids else f'{len(ids)} torrent(s)'}")
+
+def stop(args, config):
+    ids = args.ids if args.ids != ["all"] else None
+    req_args = {"ids": ids} if ids else {}
+
+    result = api_request("torrent-stop", req_args, config)
+    if result.get("result") == "success":
+        print(f"Stopped {'all torrents' if not ids else f'{len(ids)} torrent(s)'}")
+
+def stats(args, config):
+    result = api_request("session-stats", {}, config)
+    s = result.get("arguments", {})
+
+    print(f"\nActive:     {s.get('activeTorrentCount', 0)} torrents")
+    print(f"Paused:     {s.get('pausedTorrentCount', 0)} torrents")
+    print(f"Total:      {s.get('torrentCount', 0)} torrents")
+    print(f"Down Speed: {format_speed(s.get('downloadSpeed', 0))}")
+    print(f"Up Speed:   {format_speed(s.get('uploadSpeed', 0))}")
+
+    curr = s.get("current-stats", {})
+    print(f"\nThis Session:")
+    print(f"  Downloaded: {format_size(curr.get('downloadedBytes', 0))}")
+    print(f"  Uploaded:   {format_size(curr.get('uploadedBytes', 0))}")
+
+    total = s.get("cumulative-stats", {})
+    print(f"\nAll Time:")
+    print(f"  Downloaded: {format_size(total.get('downloadedBytes', 0))}")
+    print(f"  Uploaded:   {format_size(total.get('uploadedBytes', 0))}")
+
+def move(args, config):
+    result = api_request("torrent-set-location", {
+        "ids": [args.id],
+        "location": args.path,
+        "move": not args.no_move
+    }, config)
+
+    if result.get("result") == "success":
+        action = "Updated location" if args.no_move else "Moved"
+        print(f"{action} to {args.path}")
+
+def speed(args, config):
+    if args.down is not None or args.up is not None:
+        set_args = {}
+        if args.down is not None:
+            set_args["speed-limit-down"] = args.down
+            set_args["speed-limit-down-enabled"] = args.down > 0
+        if args.up is not None:
+            set_args["speed-limit-up"] = args.up
+            set_args["speed-limit-up-enabled"] = args.up > 0
+
+        api_request("session-set", set_args, config)
+        print("Speed limits updated")
+    else:
+        result = api_request("session-get", {}, config)
+        s = result.get("arguments", {})
+
+        down_limit = s.get("speed-limit-down", 0)
+        down_enabled = s.get("speed-limit-down-enabled", False)
+        up_limit = s.get("speed-limit-up", 0)
+        up_enabled = s.get("speed-limit-up-enabled", False)
+
+        print(f"Download: {down_limit} KB/s" if down_enabled else "Download: unlimited")
+        print(f"Upload:   {up_limit} KB/s" if up_enabled else "Upload:   unlimited")
+
+def watch(args, config):
+    import time
+
+    try:
+        while True:
+            result = api_request("session-stats", {}, config)
+            s = result.get("arguments", {})
+
+            active = s.get("activeTorrentCount", 0)
+            down = format_speed(s.get("downloadSpeed", 0))
+            up = format_speed(s.get("uploadSpeed", 0))
+
+            print(f"\rActive: {active} | Down: {down} | Up: {up}    ", end="", flush=True)
+
+            if active == 0:
+                print("\nAll done!")
+                break
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped")
+
+def parse_ids(id_args):
+    """Parse ID arguments supporting ranges like 1-5 and comma-separated"""
+    ids = []
+    for arg in id_args:
+        if arg.lower() == "all":
+            return ["all"]
+        if "-" in arg and not arg.startswith("-"):
+            start, end = map(int, arg.split("-"))
+            ids.extend(range(start, end + 1))
+        else:
+            ids.extend(int(x) for x in arg.split(","))
+    return ids
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Transmission CLI - Control Transmission from the command line",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  tm list                           # List all torrents
+  tm list -d                        # Show only downloading
+  tm info 5                         # Details for torrent ID 5
+  tm add magnet:?xt=...             # Add magnet link
+  tm add file.torrent               # Add torrent file
+  tm remove 1 2 3                   # Remove torrents
+  tm remove 1-5 --delete-data       # Remove with data
+  tm start 1 2 3                    # Start specific torrents
+  tm start all                      # Start all
+  tm stop all                       # Stop all
+  tm stats                          # Session statistics
+  tm speed                          # Show speed limits
+  tm speed -d 5000 -u 1000          # Set limits (KB/s, 0=unlimited)
+  tm watch                          # Watch until downloads complete
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # List
+    list_p = subparsers.add_parser("list", aliases=["ls", "l"], help="List torrents")
+    list_p.add_argument("-d", "--downloading", action="store_true", help="Downloading only")
+    list_p.add_argument("-s", "--seeding", action="store_true", help="Seeding only")
+    list_p.add_argument("-p", "--paused", action="store_true", help="Paused only")
+    list_p.add_argument("-a", "--active", action="store_true", help="Active only")
+
+    # Info
+    info_p = subparsers.add_parser("info", aliases=["i"], help="Torrent details")
+    info_p.add_argument("id", type=int, help="Torrent ID")
+    info_p.add_argument("-m", "--magnet", action="store_true", help="Show magnet link")
+
+    # Add
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add torrent")
+    add_p.add_argument("source", help="Magnet link, URL, or .torrent file")
+    add_p.add_argument("-p", "--paused", action="store_true", help="Add paused")
+    add_p.add_argument("-d", "--download-dir", help="Download directory")
+
+    # Remove
+    rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove torrents")
+    rm_p.add_argument("ids", nargs="+", help="Torrent IDs (supports ranges like 1-5)")
+    rm_p.add_argument("--delete-data", action="store_true", help="Delete downloaded data")
+
+    # Start
+    start_p = subparsers.add_parser("start", aliases=["st"], help="Start torrents")
+    start_p.add_argument("ids", nargs="+", help="Torrent IDs or 'all'")
+    start_p.add_argument("-n", "--now", action="store_true", help="Bypass queue")
+
+    # Stop
+    stop_p = subparsers.add_parser("stop", aliases=["sp"], help="Stop torrents")
+    stop_p.add_argument("ids", nargs="+", help="Torrent IDs or 'all'")
+
+    # Stats
+    subparsers.add_parser("stats", aliases=["s"], help="Session statistics")
+
+    # Move
+    move_p = subparsers.add_parser("move", aliases=["mv"], help="Move torrent data")
+    move_p.add_argument("id", type=int, help="Torrent ID")
+    move_p.add_argument("path", help="New location")
+    move_p.add_argument("--no-move", action="store_true", help="Update path without moving files")
+
+    # Speed
+    speed_p = subparsers.add_parser("speed", help="Get/set speed limits")
+    speed_p.add_argument("-d", "--down", type=int, help="Download limit KB/s (0=unlimited)")
+    speed_p.add_argument("-u", "--up", type=int, help="Upload limit KB/s (0=unlimited)")
+
+    # Watch
+    watch_p = subparsers.add_parser("watch", aliases=["w"], help="Watch until complete")
+    watch_p.add_argument("-i", "--interval", type=int, default=5, help="Update interval (seconds)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    # Parse IDs for commands that need them
+    if hasattr(args, 'ids') and args.ids:
+        args.ids = parse_ids(args.ids)
+
+    cmd_map = {
+        "list": list_cmd, "ls": list_cmd, "l": list_cmd,
+        "info": info, "i": info,
+        "add": add, "a": add,
+        "remove": remove, "rm": remove,
+        "start": start, "st": start,
+        "stop": stop, "sp": stop,
+        "stats": stats, "s": stats,
+        "move": move, "mv": move,
+        "speed": speed,
+        "watch": watch, "w": watch,
+    }
+
+    if args.command in cmd_map:
+        cmd_map[args.command](args, config)
+
+if __name__ == "__main__":
+    main()
