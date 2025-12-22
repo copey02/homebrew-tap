@@ -13,14 +13,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "trackers" / "config.json"
 
-# Resolution mappings for each tracker
-BHD_TYPES = {
-    "2160p": "UHD 100",
-    "4k": "UHD 100",
-    "1080p": "BD Remux",
-    "720p": "720p",
-}
-
+# Resolution mappings for UNIT3D trackers
 UNIT3D_RESOLUTIONS = {
     "2160p": "2",
     "4k": "2",
@@ -53,14 +46,16 @@ def bhd_search(query, config, limit=50, resolution=None):
     tracker = config["trackers"]["bhd"]
     url = f"{tracker['url']}/api/torrents/{tracker['api_key']}"
 
+    # Append resolution to search query (like nzbcli does)
+    search_query = query
+    if resolution and resolution.lower() not in query.lower():
+        search_query = f"{query} {resolution}"
+
     body = {
         "action": "search",
         "rsskey": tracker["rss_key"],
-        "search": query,
+        "search": search_query,
     }
-
-    if resolution and resolution in BHD_TYPES:
-        body["types"] = [BHD_TYPES[resolution]]
 
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -82,17 +77,17 @@ def bhd_search(query, config, limit=50, resolution=None):
         return []
 
     results = []
-    for item in result.get("Results", [])[:limit]:
+    for item in result.get("results", [])[:limit]:
         results.append({
             "tracker": "BHD",
-            "name": item.get("Name", ""),
-            "size": item.get("Size", 0),
-            "seeders": item.get("Seeders", 0),
-            "leechers": item.get("Leechers", 0),
+            "name": item.get("name", ""),
+            "size": item.get("size", 0),
+            "seeders": item.get("seeders", 0),
+            "leechers": item.get("leechers", 0),
             "download_url": item.get("download_url", ""),
             "page_url": item.get("url", ""),
-            "freeleech": item.get("Freeleech", False),
-            "internal": item.get("Internal", False),
+            "freeleech": item.get("freeleech", False),
+            "internal": item.get("internal", False),
             "created_at": item.get("created_at", ""),
         })
 
