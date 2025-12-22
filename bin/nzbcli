@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+NZBgeek CLI - Search and download NZBs from NZBgeek
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "nzbgeek" / "config.json"
+
+# NZBgeek categories
+CATEGORIES = {
+    "movies": "2000",
+    "movies-hd": "2040",
+    "movies-sd": "2030",
+    "tv": "5000",
+    "tv-hd": "5040",
+    "tv-sd": "5030",
+}
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config file not found at {CONFIG_PATH}")
+        print("Create it with: api_key, api_url, default_download_path, default_resolution")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def api_request(endpoint, params, config):
+    params["apikey"] = config["api_key"]
+    params["o"] = "json"
+    url = f"{config['api_url']}?{urllib.parse.urlencode(params)}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"API Error: {e}")
+        sys.exit(1)
+
+def format_size(bytes_val):
+    gb = int(bytes_val) / 1024 / 1024 / 1024
+    return f"{gb:.1f} GB"
+
+def search(args, config):
+    query = args.query
+
+    # Add default resolution unless --no-default-res or already specified
+    if not args.no_default_res:
+        res = config.get("default_resolution", "1080p")
+        if res.lower() not in query.lower():
+            query = f"{query} {res}"
+
+    params = {"t": "search", "q": query, "limit": args.limit}
+
+    if args.cat:
+        cat = CATEGORIES.get(args.cat, args.cat)
+        params["cat"] = cat
+
+    if args.offset:
+        params["offset"] = args.offset
+
+    data = api_request("", params, config)
+
+    # Get total from response
+    response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+    total = int(response.get("total", 0))
+    offset = int(response.get("offset", 0))
+
+    items = data.get("channel", {}).get("item", [])
+
+    if isinstance(items, dict):
+        items = [items]
+
+    if not items:
+        print("No results found")
+        return
+
+    # Pagination info
+    start = offset + 1
+    end = offset + len(items)
+
+    print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
+    print("-" * 105)
+
+    for item in items:
+        title = item.get("title", "")[:79]
+        size = format_size(item.get("enclosure", {}).get("@attributes", {}).get("length", 0))
+        date = item.get("pubDate", "")[:12]
+
+        # Get GUID for easy copying
+        attrs = item.get("attr", [])
+        guid = ""
+        for attr in attrs:
+            if attr.get("@attributes", {}).get("name") == "guid":
+                guid = attr.get("@attributes", {}).get("value", "")
+                break
+
+        print(f"{title:<80} {size:>10} {date:<12}")
+        if args.show_guid:
+            print(f"  GUID: {guid}")
+
+    print(f"\nShowing {start}-{end} of {total} results")
+    if end < total:
+        next_offset = offset + args.limit
+        print(f"Next page: nzb search \"{args.query}\" --offset {next_offset}")
+
+def get(args, config):
+    import re
+    import tempfile
+
+    guid = args.guid
+    output_dir = Path(args.output or config.get("default_download_path", "."))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download NZB to temp file first
+    url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".nzb") as tmp:
+            tmp_path = tmp.name
+        urllib.request.urlretrieve(url, tmp_path)
+    except Exception as e:
+        print(f"Download error: {e}")
+        sys.exit(1)
+
+    # Extract title from NZB meta name
+    title = guid
+    try:
+        with open(tmp_path, 'r', encoding='utf-8') as f:
+            content = f.read(4096)  # Read first 4KB for meta tags
+            match = re.search(r'<meta type="name">([^<]+)</meta>', content)
+            if match:
+                title = match.group(1)
+    except Exception:
+        pass
+
+    filename = f"{title}.nzb"
+    output_path = output_dir / filename
+
+    # Move temp file to final location
+    import shutil
+    shutil.move(tmp_path, output_path)
+
+    size = output_path.stat().st_size / 1024
+    print(f"Downloaded: {filename}")
+    print(f"Size: {size:.1f} KB")
+    print(f"Path: {output_path}")
+
+def recent(args, config):
+    query = args.group or ""
+    res = config.get("default_resolution", "1080p")
+    if not args.no_default_res:
+        query = f"{query} {res}".strip()
+
+    params = {"t": "search", "q": query, "limit": args.limit}
+
+    if args.cat:
+        cat = CATEGORIES.get(args.cat, args.cat)
+        params["cat"] = cat
+
+    if args.offset:
+        params["offset"] = args.offset
+
+    data = api_request("", params, config)
+
+    # Get total from response
+    response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+    total = int(response.get("total", 0))
+    offset = int(response.get("offset", 0))
+
+    items = data.get("channel", {}).get("item", [])
+
+    if isinstance(items, dict):
+        items = [items]
+
+    if not items:
+        print("No results found")
+        return
+
+    # Pagination info
+    start = offset + 1
+    end = offset + len(items)
+
+    # Group by show/movie name
+    seen = set()
+    print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
+    print("-" * 100)
+
+    for item in items:
+        title = item.get("title", "")
+        size = format_size(item.get("enclosure", {}).get("@attributes", {}).get("length", 0))
+        date = item.get("pubDate", "")[:12]
+
+        # For TV, dedupe by show name
+        if args.cat == "tv":
+            import re
+            match = re.match(r'(.+?)\.(S\d{2})', title)
+            if match:
+                show = match.group(1)
+                if show in seen:
+                    continue
+                seen.add(show)
+
+        attrs = item.get("attr", [])
+        guid = ""
+        for attr in attrs:
+            if attr.get("@attributes", {}).get("name") == "guid":
+                guid = attr.get("@attributes", {}).get("value", "")
+                break
+
+        print(f"{title[:74]:<75} {size:>10} {date:<12}")
+        if args.show_guid:
+            print(f"  GUID: {guid}")
+
+    print(f"\nShowing {start}-{end} of {total} results")
+    if end < total:
+        next_offset = offset + args.limit
+        group_arg = f"-g {args.group} " if args.group else ""
+        cat_arg = f"-c {args.cat} " if args.cat else ""
+        print(f"Next page: nzb recent {group_arg}{cat_arg}--offset {next_offset}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NZBgeek CLI - Search and download NZBs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  nzb search "Dogma FraMeSToR"              # Search movies (1080p default)
+  nzb search "Slow Horses S04" -c tv        # Search TV
+  nzb search "Dogma" --no-default-res       # Search without 1080p filter
+  nzb search "Dogma" --offset 50            # Page 2 of results
+  nzb get <guid>                            # Download NZB by GUID
+  nzb get <guid> -o ~/Downloads             # Download to specific folder
+  nzb recent -g FraMeSToR -c movies         # Recent FraMeSToR movies
+  nzb recent -g HONE -c tv                  # Recent HONE TV releases
+
+Categories: movies, movies-hd, tv, tv-hd (or numeric IDs)
+Default: 50 results per page, use --offset to paginate
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Search command
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search NZBgeek")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("-c", "--cat", help="Category (movies, tv, etc)")
+    search_p.add_argument("-l", "--limit", type=int, default=50, help="Max results (default: 50)")
+    search_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
+    search_p.add_argument("--no-default-res", action="store_true", help="Don't add default resolution to search")
+    search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs for downloading")
+
+    # Get/download command
+    get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download NZB by GUID")
+    get_p.add_argument("guid", help="NZB GUID to download")
+    get_p.add_argument("-o", "--output", help="Output directory")
+
+    # Recent command
+    recent_p = subparsers.add_parser("recent", aliases=["r"], help="Recent releases")
+    recent_p.add_argument("-g", "--group", help="Release group (FraMeSToR, HONE, FLUX, etc)")
+    recent_p.add_argument("-c", "--cat", help="Category (movies, tv)")
+    recent_p.add_argument("-l", "--limit", type=int, default=50, help="Max results (default: 50)")
+    recent_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
+    recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
+    recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    if args.command in ("search", "s"):
+        search(args, config)
+    elif args.command in ("get", "g", "download", "d"):
+        get(args, config)
+    elif args.command in ("recent", "r"):
+        recent(args, config)
+
+if __name__ == "__main__":
+    main()

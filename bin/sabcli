@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+SABnzbd CLI - Interact with SABnzbd from the command line
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config not found at {CONFIG_PATH}")
+        print("Create it with: url, api_key")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def api_request(mode, params, config):
+    params["mode"] = mode
+    params["apikey"] = config["api_key"]
+    params["output"] = "json"
+    url = f"{config['url']}/api?{urllib.parse.urlencode(params)}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"API Error: {e}")
+        sys.exit(1)
+
+def format_size(size_str):
+    """Convert size string like '131.7 GB' to clean format"""
+    return size_str
+
+def status(args, config):
+    data = api_request("queue", {}, config)
+    q = data.get("queue", {})
+
+    speed = q.get("speed", "0")
+    jobs = q.get("noofslots", 0)
+    eta = q.get("timeleft", "--")
+    size_left = q.get("sizeleft", "0 B")
+    size_total = q.get("size", "0 B")
+    paused = q.get("paused", False)
+
+    status_str = "PAUSED" if paused else "RUNNING"
+
+    print(f"Status: {status_str}")
+    print(f"Speed:  {speed}/s")
+    print(f"Jobs:   {jobs}")
+    print(f"Size:   {size_left} / {size_total}")
+    print(f"ETA:    {eta}")
+
+def queue(args, config):
+    data = api_request("queue", {"limit": args.limit}, config)
+    slots = data.get("queue", {}).get("slots", [])
+
+    if not slots:
+        print("Queue is empty")
+        return
+
+    print(f"\n{'#':<3} {'Name':<60} {'Size':>10} {'Progress':>10}")
+    print("-" * 86)
+
+    for i, slot in enumerate(slots, 1):
+        name = slot.get("filename", "")[:59]
+        size = slot.get("size", "")
+        pct = slot.get("percentage", "0")
+        status = slot.get("status", "")
+
+        if status == "Downloading":
+            prog = f"{pct}%"
+        else:
+            prog = status[:10]
+
+        print(f"{i:<3} {name:<60} {size:>10} {prog:>10}")
+
+    print()
+
+def history(args, config):
+    data = api_request("history", {"limit": args.limit}, config)
+    slots = data.get("history", {}).get("slots", [])
+
+    if not slots:
+        print("History is empty")
+        return
+
+    print(f"\n{'Name':<65} {'Size':>10} {'Status':>10}")
+    print("-" * 88)
+
+    for slot in slots:
+        name = slot.get("name", "")[:64]
+        size = slot.get("size", "")
+        status = slot.get("status", "")
+
+        print(f"{name:<65} {size:>10} {status:>10}")
+
+    print()
+
+def add(args, config):
+    for nzb_path in args.files:
+        path = Path(nzb_path).expanduser().resolve()
+        if not path.exists():
+            print(f"File not found: {nzb_path}")
+            continue
+
+        filename = path.name
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        boundary = '----PythonFormBoundary7MA4YWxk'
+        body = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="mode"\r\n\r\naddfile\r\n'
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="apikey"\r\n\r\n{config["api_key"]}\r\n'
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="nzbfile"; filename="{filename}"\r\n'
+            f'Content-Type: application/x-nzb\r\n\r\n'
+        ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
+
+        req = urllib.request.Request(f"{config['url']}/api", data=body)
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
+                if result.get("status"):
+                    print(f"Added: {filename}")
+                else:
+                    print(f"Failed: {filename} - {result.get('error', 'Unknown error')}")
+        except Exception as e:
+            print(f"Error adding {filename}: {e}")
+
+def pause(args, config):
+    api_request("pause", {}, config)
+    print("Queue paused")
+
+def resume(args, config):
+    api_request("resume", {}, config)
+    print("Queue resumed")
+
+def speed(args, config):
+    if args.limit is not None:
+        # Set speed limit (0 = unlimited)
+        api_request("config", {"name": "speedlimit", "value": args.limit}, config)
+        if args.limit == 0:
+            print("Speed limit: unlimited")
+        else:
+            print(f"Speed limit: {args.limit} KB/s")
+    else:
+        # Get current speed limit
+        data = api_request("queue", {}, config)
+        limit = data.get("queue", {}).get("speedlimit", "0")
+        if limit == "0" or limit == 0:
+            print("Speed limit: unlimited")
+        else:
+            print(f"Speed limit: {limit} KB/s")
+
+def watch(args, config):
+    """Watch queue until empty"""
+    import time
+
+    while True:
+        data = api_request("queue", {}, config)
+        q = data.get("queue", {})
+        jobs = int(q.get("noofslots", 0))
+        speed = q.get("speed", "0")
+        eta = q.get("timeleft", "--")
+        size_left = q.get("sizeleft", "0 B")
+
+        print(f"\rJobs: {jobs} | Speed: {speed}/s | Remaining: {size_left} | ETA: {eta}    ", end="", flush=True)
+
+        if jobs == 0:
+            print("\nQueue complete!")
+            break
+
+        time.sleep(args.interval)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SABnzbd CLI - Control SABnzbd from the command line",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sab status                    # Show queue status
+  sab queue                     # List queue items
+  sab history                   # Show download history
+  sab add *.nzb                 # Add NZB files to queue
+  sab pause                     # Pause queue
+  sab resume                    # Resume queue
+  sab speed                     # Show speed limit
+  sab speed 50000               # Set speed limit (KB/s)
+  sab speed 0                   # Unlimited speed
+  sab watch                     # Watch queue until complete
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Status command
+    subparsers.add_parser("status", aliases=["st"], help="Show queue status")
+
+    # Queue command
+    queue_p = subparsers.add_parser("queue", aliases=["q"], help="List queue items")
+    queue_p.add_argument("-l", "--limit", type=int, default=20, help="Max items to show")
+
+    # History command
+    hist_p = subparsers.add_parser("history", aliases=["h"], help="Show download history")
+    hist_p.add_argument("-l", "--limit", type=int, default=20, help="Max items to show")
+
+    # Add command
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add NZB files")
+    add_p.add_argument("files", nargs="+", help="NZB files to add")
+
+    # Pause command
+    subparsers.add_parser("pause", aliases=["p"], help="Pause queue")
+
+    # Resume command
+    subparsers.add_parser("resume", aliases=["r"], help="Resume queue")
+
+    # Speed command
+    speed_p = subparsers.add_parser("speed", aliases=["sp"], help="Get/set speed limit")
+    speed_p.add_argument("limit", type=int, nargs="?", help="Speed limit in KB/s (0 = unlimited)")
+
+    # Watch command
+    watch_p = subparsers.add_parser("watch", aliases=["w"], help="Watch queue until complete")
+    watch_p.add_argument("-i", "--interval", type=int, default=10, help="Update interval in seconds")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    cmd_map = {
+        "status": status, "st": status,
+        "queue": queue, "q": queue,
+        "history": history, "h": history,
+        "add": add, "a": add,
+        "pause": pause, "p": pause,
+        "resume": resume, "r": resume,
+        "speed": speed, "sp": speed,
+        "watch": watch, "w": watch,
+    }
+
+    if args.command in cmd_map:
+        cmd_map[args.command](args, config)
+
+if __name__ == "__main__":
+    main()
