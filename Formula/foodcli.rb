@@ -2,7 +2,7 @@ class Foodcli < Formula
   desc "FoodCLI - Search and fetch nutrition data from USDA FoodData Central"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/foodcli"
-  version "1.0.0"
+  version "1.0.1"
   sha256 "e17c88bb4bbf18a9e3a0c60c4e3bc2f518516120c5699093e0981e28eeea932f"
   license "MIT"
 
