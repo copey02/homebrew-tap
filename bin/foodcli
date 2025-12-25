@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+FoodCLI - Search and fetch nutrition data from USDA FoodData Central
+Optimized for LLM consumption with structured JSON output
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "foodcli" / "config.json"
+API_BASE = "https://api.nal.usda.gov/fdc/v1"
+
+# Key nutrients to display (nutrient number -> display name)
+KEY_NUTRIENTS = {
+    "208": "Calories",
+    "203": "Protein",
+    "204": "Total Fat",
+    "205": "Carbohydrates",
+    "291": "Fiber",
+    "269": "Sugars",
+    "307": "Sodium",
+    "301": "Calcium",
+    "303": "Iron",
+    "306": "Potassium",
+    "401": "Vitamin C",
+    "323": "Vitamin E",
+    "328": "Vitamin D",
+    "606": "Saturated Fat",
+    "601": "Cholesterol",
+}
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(json.dumps({"error": f"Config file not found at {CONFIG_PATH}",
+                          "hint": "Create config with: api_key"}), file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def api_request(endpoint, params=None, method="GET"):
+    config = load_config()
+    params = params or {}
+    params["api_key"] = config["api_key"]
+
+    url = f"{API_BASE}{endpoint}"
+
+    if method == "GET":
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url)
+    else:
+        req = urllib.request.Request(
+            f"{url}?api_key={params['api_key']}",
+            data=json.dumps({k: v for k, v in params.items() if k != "api_key"}).encode(),
+            headers={"Content-Type": "application/json"}
+        )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else str(e)
+        print(json.dumps({"error": f"API Error {e.code}", "details": error_body}))
+        sys.exit(1)
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
+
+def extract_nutrients(food_nutrients, include_all=False):
+    """Extract nutrients from API response into clean dict"""
+    nutrients = {}
+
+    for n in food_nutrients:
+        # Handle different response formats
+        if "nutrient" in n:
+            num = str(n["nutrient"].get("number", ""))
+            name = n["nutrient"].get("name", "")
+            unit = n["nutrient"].get("unitName", "")
+            amount = n.get("amount", 0)
+        else:
+            num = str(n.get("nutrientNumber", ""))
+            name = n.get("nutrientName", "")
+            unit = n.get("unitName", "")
+            amount = n.get("value", 0)
+
+        if include_all or num in KEY_NUTRIENTS:
+            display_name = KEY_NUTRIENTS.get(num, name)
+            nutrients[display_name] = {
+                "amount": round(amount, 2) if amount else 0,
+                "unit": unit
+            }
+
+    return nutrients
+
+
+def search(args):
+    """Search for foods"""
+    params = {
+        "query": args.query,
+        "pageSize": args.limit,
+        "pageNumber": args.page,
+    }
+
+    if args.type:
+        type_map = {
+            "branded": "Branded",
+            "foundation": "Foundation",
+            "survey": "Survey (FNDDS)",
+            "legacy": "SR Legacy"
+        }
+        params["dataType"] = [type_map.get(args.type, args.type)]
+
+    if args.brand:
+        params["brandOwner"] = args.brand
+
+    data = api_request("/foods/search", params, method="POST")
+
+    results = []
+    for food in data.get("foods", []):
+        item = {
+            "fdcId": food.get("fdcId"),
+            "description": food.get("description"),
+            "dataType": food.get("dataType"),
+            "brandOwner": food.get("brandOwner"),
+            "brandName": food.get("brandName"),
+            "servingSize": food.get("servingSize"),
+            "servingSizeUnit": food.get("servingSizeUnit"),
+        }
+
+        # Include basic nutrients in search results
+        if food.get("foodNutrients"):
+            item["nutrients"] = extract_nutrients(food["foodNutrients"])
+
+        results.append(item)
+
+    output = {
+        "query": args.query,
+        "totalHits": data.get("totalHits", 0),
+        "currentPage": data.get("currentPage", 1),
+        "totalPages": data.get("totalPages", 1),
+        "foods": results
+    }
+
+    if args.table:
+        print_search_table(output)
+    else:
+        print(json.dumps(output, indent=2))
+
+
+def print_search_table(data):
+    """Print search results as human-readable table"""
+    print(f"\nFound {data['totalHits']} results for '{data['query']}'")
+    print(f"Page {data['currentPage']} of {data['totalPages']}\n")
+
+    print(f"{'ID':<10} {'Description':<50} {'Type':<12} {'Cal':>6}")
+    print("-" * 82)
+
+    for food in data["foods"]:
+        desc = (food["description"] or "")[:49]
+        dtype = (food["dataType"] or "")[:11]
+        cal = food.get("nutrients", {}).get("Calories", {}).get("amount", "-")
+        print(f"{food['fdcId']:<10} {desc:<50} {dtype:<12} {cal:>6}")
+
+
+def info(args):
+    """Get detailed food information"""
+    params = {"format": "full"}
+
+    data = api_request(f"/food/{args.fdc_id}", params)
+
+    result = {
+        "fdcId": data.get("fdcId"),
+        "description": data.get("description"),
+        "dataType": data.get("dataType"),
+        "brandOwner": data.get("brandOwner"),
+        "brandName": data.get("brandName"),
+        "ingredients": data.get("ingredients"),
+        "servingSize": data.get("servingSize"),
+        "servingSizeUnit": data.get("servingSizeUnit"),
+        "householdServingFullText": data.get("householdServingFullText"),
+        "nutrients": extract_nutrients(data.get("foodNutrients", []), include_all=args.all_nutrients)
+    }
+
+    if args.table:
+        print_info_table(result)
+    else:
+        print(json.dumps(result, indent=2))
+
+
+def print_info_table(data):
+    """Print food info as human-readable format"""
+    print(f"\n{data['description']}")
+    print(f"FDC ID: {data['fdcId']} | Type: {data['dataType']}")
+
+    if data.get("brandOwner"):
+        print(f"Brand: {data['brandOwner']}")
+
+    serving = []
+    if data.get("servingSize"):
+        serving.append(f"{data['servingSize']} {data.get('servingSizeUnit', '')}")
+    if data.get("householdServingFullText"):
+        serving.append(data["householdServingFullText"])
+    if serving:
+        print(f"Serving: {' | '.join(serving)}")
+
+    if data.get("ingredients"):
+        print(f"\nIngredients: {data['ingredients'][:200]}...")
+
+    print(f"\n{'Nutrient':<20} {'Amount':>10}")
+    print("-" * 32)
+
+    # Sort nutrients by key nutrient order
+    priority_order = list(KEY_NUTRIENTS.values())
+    sorted_nutrients = sorted(
+        data["nutrients"].items(),
+        key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999
+    )
+
+    for name, val in sorted_nutrients:
+        amount = f"{val['amount']} {val['unit']}"
+        print(f"{name:<20} {amount:>10}")
+
+
+def nutrients(args):
+    """Get just the nutrient breakdown"""
+    params = {"format": "abridged"}
+
+    data = api_request(f"/food/{args.fdc_id}", params)
+
+    result = {
+        "fdcId": data.get("fdcId"),
+        "description": data.get("description"),
+        "servingSize": data.get("servingSize"),
+        "servingSizeUnit": data.get("servingSizeUnit"),
+        "nutrients": extract_nutrients(data.get("foodNutrients", []), include_all=args.all)
+    }
+
+    if args.table:
+        print(f"\nNutrients for: {result['description']}")
+        if result.get("servingSize"):
+            print(f"Per {result['servingSize']} {result.get('servingSizeUnit', '')}")
+        print()
+        for name, val in result["nutrients"].items():
+            print(f"  {name}: {val['amount']} {val['unit']}")
+    else:
+        print(json.dumps(result, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FoodCLI - USDA FoodData Central nutrition lookup",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  food search "chicken breast"              # Search for foods
+  food search "protein bar" --type branded  # Search branded foods only
+  food search "organic milk" --brand "Horizon"
+  food info 746771                          # Get full nutrition info
+  food nutrients 746771                     # Get nutrient breakdown
+  food nutrients 746771 --all               # Include all nutrients
+
+  # Human-readable output
+  food search "apple" --table
+  food info 746771 --table
+
+Output is JSON by default (optimized for LLM/programmatic use).
+Use --table for human-readable format.
+
+Data types: branded, foundation, survey, legacy
+        """
+    )
+
+    # Global options
+    parser.add_argument("--table", "-t", action="store_true",
+                        help="Human-readable table output instead of JSON")
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Search command
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search for foods")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("-l", "--limit", type=int, default=25, help="Results per page (default: 25)")
+    search_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    search_p.add_argument("--type", choices=["branded", "foundation", "survey", "legacy"],
+                          help="Filter by data type")
+    search_p.add_argument("--brand", help="Filter by brand owner")
+    search_p.add_argument("--table", "-t", action="store_true", help="Table output")
+
+    # Info command
+    info_p = subparsers.add_parser("info", aliases=["i"], help="Get detailed food info")
+    info_p.add_argument("fdc_id", help="FDC ID of the food")
+    info_p.add_argument("--all-nutrients", "-a", action="store_true",
+                        help="Include all nutrients, not just key ones")
+    info_p.add_argument("--table", "-t", action="store_true", help="Table output")
+
+    # Nutrients command
+    nutrients_p = subparsers.add_parser("nutrients", aliases=["n"], help="Get nutrient breakdown")
+    nutrients_p.add_argument("fdc_id", help="FDC ID of the food")
+    nutrients_p.add_argument("--all", "-a", action="store_true", help="Include all nutrients")
+    nutrients_p.add_argument("--table", "-t", action="store_true", help="Table output")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command in ("search", "s"):
+        search(args)
+    elif args.command in ("info", "i"):
+        info(args)
+    elif args.command in ("nutrients", "n"):
+        nutrients(args)
+
+
+if __name__ == "__main__":
+    main()
