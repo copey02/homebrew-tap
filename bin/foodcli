@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 FoodCLI - Search and fetch nutrition data from USDA FoodData Central
-Optimized for LLM consumption with structured JSON output
 """
 
 import argparse
@@ -148,10 +147,10 @@ def search(args):
         "foods": results
     }
 
-    if args.table:
-        print_search_table(output)
-    else:
+    if args.json:
         print(json.dumps(output, indent=2))
+    else:
+        print_search_table(output)
 
 
 def print_search_table(data):
@@ -188,10 +187,10 @@ def info(args):
         "nutrients": extract_nutrients(data.get("foodNutrients", []), include_all=args.all_nutrients)
     }
 
-    if args.table:
-        print_info_table(result)
-    else:
+    if args.json:
         print(json.dumps(result, indent=2))
+    else:
+        print_info_table(result)
 
 
 def print_info_table(data):
@@ -242,15 +241,15 @@ def nutrients(args):
         "nutrients": extract_nutrients(data.get("foodNutrients", []), include_all=args.all)
     }
 
-    if args.table:
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
         print(f"\nNutrients for: {result['description']}")
         if result.get("servingSize"):
             print(f"Per {result['servingSize']} {result.get('servingSizeUnit', '')}")
         print()
         for name, val in result["nutrients"].items():
             print(f"  {name}: {val['amount']} {val['unit']}")
-    else:
-        print(json.dumps(result, indent=2))
 
 
 def main():
@@ -266,20 +265,17 @@ Examples:
   food nutrients 746771                     # Get nutrient breakdown
   food nutrients 746771 --all               # Include all nutrients
 
-  # Human-readable output
-  food search "apple" --table
-  food info 746771 --table
-
-Output is JSON by default (optimized for LLM/programmatic use).
-Use --table for human-readable format.
+  # JSON output (for LLM/programmatic use)
+  food search "apple" --json
+  food info 746771 --json
 
 Data types: branded, foundation, survey, legacy
         """
     )
 
     # Global options
-    parser.add_argument("--table", "-t", action="store_true",
-                        help="Human-readable table output instead of JSON")
+    parser.add_argument("--json", "-j", action="store_true",
+                        help="JSON output (for LLM/programmatic use)")
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
@@ -291,20 +287,20 @@ Data types: branded, foundation, survey, legacy
     search_p.add_argument("--type", choices=["branded", "foundation", "survey", "legacy"],
                           help="Filter by data type")
     search_p.add_argument("--brand", help="Filter by brand owner")
-    search_p.add_argument("--table", "-t", action="store_true", help="Table output")
+    search_p.add_argument("--json", "-j", action="store_true", help="JSON output")
 
     # Info command
     info_p = subparsers.add_parser("info", aliases=["i"], help="Get detailed food info")
     info_p.add_argument("fdc_id", help="FDC ID of the food")
     info_p.add_argument("--all-nutrients", "-a", action="store_true",
                         help="Include all nutrients, not just key ones")
-    info_p.add_argument("--table", "-t", action="store_true", help="Table output")
+    info_p.add_argument("--json", "-j", action="store_true", help="JSON output")
 
     # Nutrients command
     nutrients_p = subparsers.add_parser("nutrients", aliases=["n"], help="Get nutrient breakdown")
     nutrients_p.add_argument("fdc_id", help="FDC ID of the food")
     nutrients_p.add_argument("--all", "-a", action="store_true", help="Include all nutrients")
-    nutrients_p.add_argument("--table", "-t", action="store_true", help="Table output")
+    nutrients_p.add_argument("--json", "-j", action="store_true", help="JSON output")
 
     args = parser.parse_args()
 

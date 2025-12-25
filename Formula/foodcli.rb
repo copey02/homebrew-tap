@@ -3,7 +3,7 @@ class Foodcli < Formula
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/foodcli"
   version "1.0.0"
-  sha256 "60388107d33f1cfe21a88e92892eb5a829e2447be68521f53182fc9637256b18"
+  sha256 "e17c88bb4bbf18a9e3a0c60c4e3bc2f518516120c5699093e0981e28eeea932f"
   license "MIT"
 
   depends_on "python@3"
@@ -23,12 +23,10 @@ class Foodcli < Formula
         https://fdc.nal.usda.gov/api-key-signup.html
 
       Usage:
-        food search "chicken breast"          # Search foods (JSON output)
-        food search "apple" --table           # Human-readable output
+        food search "chicken breast"          # Search foods
         food info 746771                      # Get nutrition info by FDC ID
         food nutrients 746771                 # Get nutrient breakdown
-
-      Output is JSON by default (optimized for LLM/programmatic use).
+        food search "apple" --json            # JSON output for LLM use
     EOS
   end
 
