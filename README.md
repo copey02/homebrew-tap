@@ -13,15 +13,15 @@ brew install nzbcli sabcli tkcli tmcli tidarrcli foodcli
 
 ### foodcli (food)
 
-FoodCLI - Search and fetch nutrition data from USDA FoodData Central.
+FoodCLI - Nutrition lookup from USDA FoodData Central and Open Food Facts.
 
 ```bash
-food search "chicken breast"          # Search foods
-food search "protein bar" --type branded  # Search branded foods
-food info 746771                      # Get full nutrition info
-food nutrients 746771                 # Get nutrient breakdown
-food nutrients 746771 --all           # Include all nutrients
-food search "apple" --json            # JSON output for LLM use
+food search "chicken breast"              # Search USDA (default)
+food search "nutella" --source off        # Search Open Food Facts
+food info 746771                          # USDA food by FDC ID
+food info 3017620422003 --source off      # OFF product by barcode
+food nutrients 746771 --all               # All nutrients
+food search "apple" --json                # JSON output for LLM use
 ```
 
 ### tidarrcli (td)

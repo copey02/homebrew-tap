@@ -1,9 +1,9 @@
 class Foodcli < Formula
-  desc "FoodCLI - Search and fetch nutrition data from USDA FoodData Central"
+  desc "FoodCLI - Nutrition lookup from USDA and Open Food Facts"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/foodcli"
-  version "1.0.1"
-  sha256 "e17c88bb4bbf18a9e3a0c60c4e3bc2f518516120c5699093e0981e28eeea932f"
+  version "1.1.0"
+  sha256 "ad17748b321de3d8654a8667a2b51d71b802a28b179df7a4c3f49db6ade0848b"
   license "MIT"
 
   depends_on "python@3"
@@ -14,19 +14,20 @@ class Foodcli < Formula
 
   def caveats
     <<~EOS
-      Create config file at ~/.config/foodcli/config.json:
-        {
-          "api_key": "YOUR_API_KEY"
-        }
+      Sources:
+        usda  - USDA FoodData Central (requires API key)
+        off   - Open Food Facts (no API key, global products)
 
-      Get your free API key at:
-        https://fdc.nal.usda.gov/api-key-signup.html
+      Config (only needed for USDA):
+        mkdir -p ~/.config/foodcli
+        echo '{"api_key": "YOUR_KEY"}' > ~/.config/foodcli/config.json
+        Get free key: https://fdc.nal.usda.gov/api-key-signup.html
 
       Usage:
-        food search "chicken breast"          # Search foods
-        food info 746771                      # Get nutrition info by FDC ID
-        food nutrients 746771                 # Get nutrient breakdown
-        food search "apple" --json            # JSON output for LLM use
+        food search "chicken"                     # Search USDA
+        food search "nutella" --source off        # Search Open Food Facts
+        food info 746771                          # USDA by FDC ID
+        food info 3017620422003 --source off      # OFF by barcode
     EOS
   end
 
