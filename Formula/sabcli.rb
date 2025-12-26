@@ -2,8 +2,8 @@ class Sabcli < Formula
   desc "SABnzbd CLI - Control SABnzbd from the command line"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/sabcli"
-  version "1.1.0"
-  sha256 "661d7636fb8428ddb4d469823ca5213d3c214d607cd81de5df8e3681b311dac4"
+  version "1.2.0"
+  sha256 "751bfdf4b36de4a50ca0cdd6aff3dd7e26fa44283c020a4789954b33fbdf7768"
   license "MIT"
 
   depends_on "python@3"

@@ -159,6 +159,45 @@ def add(args, config):
             except Exception as e:
                 print(f"Error adding {filename}: {e}")
 
+def delete(args, config):
+    """Delete items from queue by index or pattern"""
+    data = api_request("queue", {"limit": 500}, config)
+    slots = data.get("queue", {}).get("slots", [])
+
+    if not slots:
+        print("Queue is empty")
+        return
+
+    to_delete = []
+
+    if args.pattern:
+        # Find by pattern match
+        import re
+        pattern = re.compile(args.pattern, re.IGNORECASE)
+        for slot in slots:
+            name = slot.get("filename", "")
+            nzo_id = slot.get("nzo_id", "")
+            if pattern.search(name):
+                to_delete.append((nzo_id, name))
+    else:
+        # Delete by index (1-based)
+        for idx in args.indices:
+            if 1 <= idx <= len(slots):
+                slot = slots[idx - 1]
+                to_delete.append((slot.get("nzo_id", ""), slot.get("filename", "")))
+            else:
+                print(f"Invalid index: {idx}")
+
+    if not to_delete:
+        print("No matching items found")
+        return
+
+    for nzo_id, name in to_delete:
+        api_request("queue", {"name": "delete", "value": nzo_id}, config)
+        print(f"Deleted: {name[:70]}")
+
+    print(f"\nDeleted {len(to_delete)} items")
+
 def pause(args, config):
     api_request("pause", {}, config)
     print("Queue paused")
@@ -215,6 +254,9 @@ Examples:
   sab history                   # Show download history
   sab add *.nzb                 # Add NZB files to queue
   sab add https://...           # Add NZB by URL
+  sab delete 5                  # Delete item #5 from queue
+  sab delete 1 2 3              # Delete multiple items
+  sab delete -p "Will.*Grace"   # Delete by pattern
   sab pause                     # Pause queue
   sab resume                    # Resume queue
   sab speed                     # Show speed limit
@@ -240,6 +282,11 @@ Examples:
     # Add command
     add_p = subparsers.add_parser("add", aliases=["a"], help="Add NZB files or URLs")
     add_p.add_argument("items", nargs="+", help="NZB files or URLs to add")
+
+    # Delete command
+    del_p = subparsers.add_parser("delete", aliases=["del", "rm"], help="Delete items from queue")
+    del_p.add_argument("indices", nargs="*", type=int, help="Queue indices to delete (1-based)")
+    del_p.add_argument("-p", "--pattern", help="Delete by regex pattern match")
 
     # Pause command
     subparsers.add_parser("pause", aliases=["p"], help="Pause queue")
@@ -268,6 +315,7 @@ Examples:
         "queue": queue, "q": queue,
         "history": history, "h": history,
         "add": add, "a": add,
+        "delete": delete, "del": delete, "rm": delete,
         "pause": pause, "p": pause,
         "resume": resume, "r": resume,
         "speed": speed, "sp": speed,
