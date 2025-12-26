@@ -1,0 +1,1120 @@
+#!/usr/bin/env python3
+"""
+Sonarr CLI - Manage TV series and downloads via Sonarr API
+Supports multiple Sonarr instances (e.g., main + 4K)
+"""
+
+import argparse
+import json
+import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime, timedelta
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "sonarr" / "config.json"
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config file not found at {CONFIG_PATH}")
+        print("Create it with your Sonarr instance(s). See --help for format.")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def get_instance(config, instance_name=None):
+    """Get instance config by name or default."""
+    instances = config.get("instances", {})
+
+    if not instances:
+        # Legacy single-instance config
+        if "url" in config and "api_key" in config:
+            return {"url": config["url"], "api_key": config["api_key"]}
+        print("Error: No instances configured")
+        sys.exit(1)
+
+    name = instance_name or config.get("default_instance", "main")
+    if name not in instances:
+        print(f"Error: Instance '{name}' not found")
+        print(f"Available: {', '.join(instances.keys())}")
+        sys.exit(1)
+
+    return instances[name]
+
+
+def api_request(instance, endpoint, method="GET", data=None, params=None):
+    """Make API request to Sonarr instance."""
+    base_url = instance["url"].rstrip("/")
+    api_key = instance["api_key"]
+
+    url = f"{base_url}/api/v3/{endpoint.lstrip('/')}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    headers = {
+        "X-Api-Key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    body = None
+    if data:
+        body = json.dumps(data).encode("utf-8")
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            response_data = resp.read().decode()
+            if response_data:
+                return json.loads(response_data)
+            return {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        try:
+            error_json = json.loads(error_body)
+            msg = error_json.get("message", error_body)
+        except json.JSONDecodeError:
+            msg = error_body or str(e)
+        print(f"API Error ({e.code}): {msg}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection Error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def format_size(bytes_val):
+    """Format bytes to human readable size."""
+    try:
+        val = int(bytes_val)
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if val < 1024:
+                return f"{val:.1f} {unit}"
+            val /= 1024
+        return f"{val:.1f} PB"
+    except (ValueError, TypeError):
+        return "?"
+
+
+def format_date(date_str):
+    """Format ISO date to readable format."""
+    if not date_str:
+        return "N/A"
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return date_str[:10] if date_str else "N/A"
+
+
+def format_short_date(date_str):
+    """Format to just date."""
+    if not date_str:
+        return "N/A"
+    try:
+        return date_str[:10]
+    except (ValueError, TypeError):
+        return "N/A"
+
+
+def truncate(text, length):
+    """Truncate text with ellipsis."""
+    if not text:
+        return ""
+    if len(text) <= length:
+        return text
+    return text[:length - 1] + "…"
+
+
+# =============================================================================
+# SERIES COMMANDS
+# =============================================================================
+
+def cmd_series(args, config):
+    """List all series."""
+    instance = get_instance(config, args.instance)
+    series_list = api_request(instance, "series")
+
+    if not series_list:
+        print("No series found")
+        return
+
+    # Apply filters
+    if args.monitored:
+        series_list = [s for s in series_list if s.get("monitored")]
+    if args.unmonitored:
+        series_list = [s for s in series_list if not s.get("monitored")]
+    if args.continuing:
+        series_list = [s for s in series_list if s.get("status") == "continuing"]
+    if args.ended:
+        series_list = [s for s in series_list if s.get("status") == "ended"]
+
+    if args.json:
+        print(json.dumps(series_list, indent=2))
+        return
+
+    # Sort by title
+    series_list.sort(key=lambda x: x.get("title", "").lower())
+
+    print(f"\n{'ID':<6} {'Title':<40} {'Year':<6} {'Status':<12} {'Episodes':>10} {'Size':>10}")
+    print("-" * 90)
+
+    for s in series_list:
+        title = truncate(s.get("title", ""), 39)
+        year = s.get("year", "")
+        status = s.get("status", "unknown")
+        stats = s.get("statistics", {})
+        episodes = f"{stats.get('episodeFileCount', 0)}/{stats.get('episodeCount', 0)}"
+        size = format_size(stats.get("sizeOnDisk", 0))
+        monitored = "●" if s.get("monitored") else "○"
+
+        print(f"{s['id']:<6} {monitored} {title:<38} {year:<6} {status:<12} {episodes:>10} {size:>10}")
+
+    print(f"\nTotal: {len(series_list)} series")
+
+
+def cmd_search(args, config):
+    """Search for series to add."""
+    instance = get_instance(config, args.instance)
+    results = api_request(instance, "series/lookup", params={"term": args.query})
+
+    if not results:
+        print("No results found")
+        return
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return
+
+    print(f"\n{'#':<3} {'TVDB':<8} {'Title':<45} {'Year':<6} {'Status':<12}")
+    print("-" * 80)
+
+    for i, s in enumerate(results[:args.limit], 1):
+        title = truncate(s.get("title", ""), 44)
+        year = s.get("year", "")
+        status = s.get("status", "unknown")
+        tvdb = s.get("tvdbId", "")
+
+        # Check if already added
+        added = " [+]" if s.get("id") else ""
+
+        print(f"{i:<3} {tvdb:<8} {title:<45} {year:<6} {status:<12}{added}")
+
+    print(f"\nShowing {min(len(results), args.limit)} of {len(results)} results")
+    print("Use 'snr add <number>' to add a series from this search")
+
+
+def cmd_add(args, config):
+    """Add a series."""
+    instance = get_instance(config, args.instance)
+
+    # Get quality profiles and root folders
+    profiles = api_request(instance, "qualityprofile")
+    root_folders = api_request(instance, "rootfolder")
+
+    if not profiles:
+        print("Error: No quality profiles found")
+        sys.exit(1)
+    if not root_folders:
+        print("Error: No root folders configured")
+        sys.exit(1)
+
+    # Determine quality profile
+    profile_id = None
+    if args.quality:
+        for p in profiles:
+            if p["name"].lower() == args.quality.lower() or str(p["id"]) == args.quality:
+                profile_id = p["id"]
+                break
+        if not profile_id:
+            print(f"Error: Quality profile '{args.quality}' not found")
+            print(f"Available: {', '.join(p['name'] for p in profiles)}")
+            sys.exit(1)
+    else:
+        default_profile = config.get("default_quality_profile")
+        if default_profile:
+            for p in profiles:
+                if p["name"].lower() == default_profile.lower():
+                    profile_id = p["id"]
+                    break
+        if not profile_id:
+            profile_id = profiles[0]["id"]
+
+    # Determine root folder
+    root_path = None
+    if args.root:
+        for rf in root_folders:
+            if rf["path"] == args.root or str(rf["id"]) == args.root:
+                root_path = rf["path"]
+                break
+        if not root_path:
+            print(f"Error: Root folder '{args.root}' not found")
+            sys.exit(1)
+    else:
+        default_root = config.get("default_root_folder")
+        if default_root:
+            for rf in root_folders:
+                if rf["path"] == default_root:
+                    root_path = rf["path"]
+                    break
+        if not root_path:
+            root_path = root_folders[0]["path"]
+
+    # If given a number, search first
+    if args.tvdb_or_num.isdigit() and int(args.tvdb_or_num) <= 100:
+        # Likely a search result number - need to search again
+        print("Error: Please provide TVDB ID directly or use 'snr search' then 'snr add <tvdb_id>'")
+        sys.exit(1)
+
+    # Look up by TVDB ID
+    results = api_request(instance, "series/lookup", params={"term": f"tvdb:{args.tvdb_or_num}"})
+
+    if not results:
+        print(f"No series found for TVDB ID: {args.tvdb_or_num}")
+        sys.exit(1)
+
+    series = results[0]
+
+    # Check if already added
+    if series.get("id"):
+        print(f"Series already exists: {series['title']} (ID: {series['id']})")
+        return
+
+    # Prepare add request
+    add_data = {
+        "tvdbId": series["tvdbId"],
+        "title": series["title"],
+        "qualityProfileId": profile_id,
+        "rootFolderPath": root_path,
+        "monitored": not args.unmonitored,
+        "seasonFolder": True,
+        "addOptions": {
+            "monitor": args.monitor or "all",
+            "searchForMissingEpisodes": args.search,
+            "searchForCutoffUnmetEpisodes": False,
+        },
+    }
+
+    result = api_request(instance, "series", method="POST", data=add_data)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Added: {result['title']} (ID: {result['id']})")
+        print(f"  Quality: {next((p['name'] for p in profiles if p['id'] == profile_id), 'Unknown')}")
+        print(f"  Root: {root_path}")
+        if args.search:
+            print("  Searching for episodes...")
+
+
+def cmd_info(args, config):
+    """Show detailed series info."""
+    instance = get_instance(config, args.instance)
+
+    series = api_request(instance, f"series/{args.series_id}")
+
+    if args.json:
+        print(json.dumps(series, indent=2))
+        return
+
+    stats = series.get("statistics", {})
+
+    print(f"\n{series['title']} ({series.get('year', 'N/A')})")
+    print("=" * 60)
+    print(f"ID:          {series['id']}")
+    print(f"TVDB:        {series.get('tvdbId', 'N/A')}")
+    print(f"IMDB:        {series.get('imdbId', 'N/A')}")
+    print(f"Status:      {series.get('status', 'unknown')}")
+    print(f"Network:     {series.get('network', 'N/A')}")
+    print(f"Runtime:     {series.get('runtime', 0)} min")
+    print(f"Genres:      {', '.join(series.get('genres', []))}")
+    print(f"Monitored:   {'Yes' if series.get('monitored') else 'No'}")
+    print(f"Path:        {series.get('path', 'N/A')}")
+    print()
+    print(f"Seasons:     {stats.get('seasonCount', 0)}")
+    print(f"Episodes:    {stats.get('episodeFileCount', 0)}/{stats.get('episodeCount', 0)}")
+    print(f"Size:        {format_size(stats.get('sizeOnDisk', 0))}")
+    print(f"Percent:     {stats.get('percentOfEpisodes', 0):.1f}%")
+
+    if series.get("overview"):
+        print(f"\n{series['overview'][:500]}")
+
+
+def cmd_delete(args, config):
+    """Delete a series."""
+    instance = get_instance(config, args.instance)
+
+    # Get series info first
+    series = api_request(instance, f"series/{args.series_id}")
+
+    if not args.yes:
+        print(f"Delete '{series['title']}'?")
+        if args.delete_files:
+            print(f"  WARNING: Will also delete {format_size(series.get('statistics', {}).get('sizeOnDisk', 0))} of files!")
+        response = input("Type 'yes' to confirm: ")
+        if response.lower() != "yes":
+            print("Cancelled")
+            return
+
+    params = {"deleteFiles": "true" if args.delete_files else "false"}
+    api_request(instance, f"series/{args.series_id}", method="DELETE", params=params)
+
+    print(f"Deleted: {series['title']}")
+    if args.delete_files:
+        print("  Files removed from disk")
+
+
+# =============================================================================
+# EPISODE COMMANDS
+# =============================================================================
+
+def cmd_episodes(args, config):
+    """List episodes for a series."""
+    instance = get_instance(config, args.instance)
+
+    episodes = api_request(instance, "episode", params={"seriesId": args.series_id})
+
+    if not episodes:
+        print("No episodes found")
+        return
+
+    # Filter by season if specified
+    if args.season is not None:
+        episodes = [e for e in episodes if e.get("seasonNumber") == args.season]
+
+    # Filter by missing/downloaded
+    if args.missing:
+        episodes = [e for e in episodes if not e.get("hasFile")]
+    if args.downloaded:
+        episodes = [e for e in episodes if e.get("hasFile")]
+
+    if args.json:
+        print(json.dumps(episodes, indent=2))
+        return
+
+    # Group by season
+    seasons = {}
+    for ep in episodes:
+        sn = ep.get("seasonNumber", 0)
+        if sn not in seasons:
+            seasons[sn] = []
+        seasons[sn].append(ep)
+
+    for season_num in sorted(seasons.keys()):
+        eps = seasons[season_num]
+        print(f"\nSeason {season_num}")
+        print("-" * 70)
+
+        for ep in sorted(eps, key=lambda x: x.get("episodeNumber", 0)):
+            ep_num = ep.get("episodeNumber", 0)
+            title = truncate(ep.get("title", "TBA"), 40)
+            air_date = format_short_date(ep.get("airDate"))
+            status = "✓" if ep.get("hasFile") else "○"
+            monitored = "●" if ep.get("monitored") else "○"
+
+            quality = ""
+            if ep.get("hasFile") and ep.get("episodeFile"):
+                ef = ep["episodeFile"]
+                quality = ef.get("quality", {}).get("quality", {}).get("name", "")
+
+            print(f"  {status} {season_num:02d}x{ep_num:02d} {monitored} {title:<40} {air_date} {quality}")
+
+
+def cmd_episearch(args, config):
+    """Search for episode releases."""
+    instance = get_instance(config, args.instance)
+
+    releases = api_request(instance, "release", params={"episodeId": args.episode_id})
+
+    if not releases:
+        print("No releases found")
+        return
+
+    if args.json:
+        print(json.dumps(releases, indent=2))
+        return
+
+    # Sort by quality weight descending
+    releases.sort(key=lambda x: (
+        x.get("qualityWeight", 0),
+        x.get("seeders", 0)
+    ), reverse=True)
+
+    releases = releases[:args.limit]
+
+    print(f"\n{'#':<3} {'Quality':<15} {'Title':<55} {'Size':>8} {'S':>4} {'Age':>6}")
+    print("-" * 100)
+
+    for i, r in enumerate(releases, 1):
+        quality = r.get("quality", {}).get("quality", {}).get("name", "Unknown")
+        title = truncate(r.get("title", ""), 54)
+        size = format_size(r.get("size", 0))
+        seeders = r.get("seeders", 0) if r.get("protocol") == "torrent" else "-"
+        age = f"{r.get('age', 0)}d"
+
+        flags = []
+        if r.get("approved"):
+            flags.append("✓")
+        if r.get("rejected"):
+            flags.append("✗")
+
+        flag_str = " ".join(flags)
+
+        print(f"{i:<3} {quality:<15} {title:<55} {size:>8} {seeders:>4} {age:>6} {flag_str}")
+
+    # Handle grab
+    if args.grab:
+        try:
+            grab_idx = int(args.grab) - 1
+            if 0 <= grab_idx < len(releases):
+                release = releases[grab_idx]
+                grab_data = {
+                    "guid": release["guid"],
+                    "indexerId": release["indexerId"],
+                }
+                api_request(instance, "release", method="POST", data=grab_data)
+                print(f"\nGrabbed: {release['title']}")
+            else:
+                print(f"\nError: Invalid release number {args.grab}")
+        except ValueError:
+            print(f"\nError: Invalid grab index '{args.grab}'")
+    else:
+        print(f"\nUse 'snr episearch {args.episode_id} --grab <#>' to grab a release")
+
+
+# =============================================================================
+# QUEUE COMMANDS
+# =============================================================================
+
+def cmd_queue(args, config):
+    """Show download queue."""
+    instance = get_instance(config, args.instance)
+
+    params = {"page": 1, "pageSize": args.limit}
+    result = api_request(instance, "queue", params=params)
+
+    records = result.get("records", [])
+
+    if not records:
+        print("Queue is empty")
+        return
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"\n{'ID':<6} {'Series':<30} {'Episode':<12} {'Quality':<12} {'Status':<15} {'Progress':>8}")
+    print("-" * 90)
+
+    for item in records:
+        q_id = item.get("id", "")
+        series = truncate(item.get("series", {}).get("title", "Unknown"), 29)
+        episode = item.get("episode", {})
+        ep_str = f"S{episode.get('seasonNumber', 0):02d}E{episode.get('episodeNumber', 0):02d}"
+        quality = item.get("quality", {}).get("quality", {}).get("name", "?")
+        status = item.get("status", "unknown")
+
+        # Calculate progress
+        size = item.get("size", 0)
+        sizeleft = item.get("sizeleft", 0)
+        if size > 0:
+            progress = ((size - sizeleft) / size) * 100
+            progress_str = f"{progress:.1f}%"
+        else:
+            progress_str = "N/A"
+
+        print(f"{q_id:<6} {series:<30} {ep_str:<12} {quality:<12} {status:<15} {progress_str:>8}")
+
+    total = result.get("totalRecords", len(records))
+    print(f"\nShowing {len(records)} of {total} items")
+
+
+def cmd_status(args, config):
+    """Show queue status summary."""
+    instance = get_instance(config, args.instance)
+
+    status = api_request(instance, "queue/status")
+
+    if args.json:
+        print(json.dumps(status, indent=2))
+        return
+
+    print("\nQueue Status")
+    print("-" * 30)
+    print(f"Total:       {status.get('totalCount', 0)}")
+    print(f"Downloading: {status.get('count', 0)}")
+    print(f"Errors:      {status.get('errors', False)}")
+    print(f"Warnings:    {status.get('warnings', False)}")
+
+
+def cmd_grab(args, config):
+    """Force grab a queue item."""
+    instance = get_instance(config, args.instance)
+
+    api_request(instance, f"queue/grab/{args.queue_id}", method="POST")
+    print(f"Grabbed queue item {args.queue_id}")
+
+
+def cmd_remove(args, config):
+    """Remove item from queue."""
+    instance = get_instance(config, args.instance)
+
+    params = {
+        "removeFromClient": "true" if args.from_client else "false",
+        "blocklist": "true" if args.blocklist else "false",
+    }
+
+    api_request(instance, f"queue/{args.queue_id}", method="DELETE", params=params)
+    print(f"Removed queue item {args.queue_id}")
+
+
+# =============================================================================
+# CALENDAR & WANTED
+# =============================================================================
+
+def cmd_calendar(args, config):
+    """Show upcoming episodes."""
+    instance = get_instance(config, args.instance)
+
+    start = datetime.now()
+    end = start + timedelta(days=args.days)
+
+    params = {
+        "start": start.strftime("%Y-%m-%d"),
+        "end": end.strftime("%Y-%m-%d"),
+        "unmonitored": "true" if args.unmonitored else "false",
+    }
+
+    episodes = api_request(instance, "calendar", params=params)
+
+    if not episodes:
+        print(f"No episodes in the next {args.days} days")
+        return
+
+    if args.json:
+        print(json.dumps(episodes, indent=2))
+        return
+
+    # Sort by air date
+    episodes.sort(key=lambda x: x.get("airDateUtc", ""))
+
+    print(f"\n{'Date':<12} {'Time':<6} {'Series':<35} {'Episode':<10} {'Title':<25}")
+    print("-" * 95)
+
+    current_date = None
+    for ep in episodes:
+        air = ep.get("airDateUtc", "")
+        if air:
+            try:
+                dt = datetime.fromisoformat(air.replace("Z", "+00:00"))
+                date_str = dt.strftime("%Y-%m-%d")
+                time_str = dt.strftime("%H:%M")
+            except ValueError:
+                date_str = air[:10]
+                time_str = ""
+        else:
+            date_str = "TBA"
+            time_str = ""
+
+        # Group by date
+        if date_str != current_date:
+            if current_date is not None:
+                print()
+            current_date = date_str
+
+        series = truncate(ep.get("series", {}).get("title", "Unknown"), 34)
+        ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
+        title = truncate(ep.get("title", "TBA"), 24)
+        has_file = "✓" if ep.get("hasFile") else ""
+
+        print(f"{date_str:<12} {time_str:<6} {series:<35} {ep_str:<10} {title:<25} {has_file}")
+
+
+def cmd_wanted(args, config):
+    """Show missing/wanted episodes."""
+    instance = get_instance(config, args.instance)
+
+    params = {
+        "page": args.page,
+        "pageSize": args.limit,
+        "sortKey": "airDateUtc",
+        "sortDirection": "descending",
+    }
+
+    result = api_request(instance, "wanted/missing", params=params)
+    records = result.get("records", [])
+
+    if not records:
+        print("No missing episodes")
+        return
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"\n{'ID':<8} {'Series':<35} {'Episode':<10} {'Title':<30} {'Air Date':<12}")
+    print("-" * 100)
+
+    for ep in records:
+        ep_id = ep.get("id", "")
+        series = truncate(ep.get("series", {}).get("title", "Unknown"), 34)
+        ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
+        title = truncate(ep.get("title", "TBA"), 29)
+        air_date = format_short_date(ep.get("airDateUtc"))
+
+        print(f"{ep_id:<8} {series:<35} {ep_str:<10} {title:<30} {air_date:<12}")
+
+    total = result.get("totalRecords", len(records))
+    print(f"\nPage {args.page}: {len(records)} of {total} missing episodes")
+
+
+def cmd_cutoff(args, config):
+    """Show episodes below quality cutoff."""
+    instance = get_instance(config, args.instance)
+
+    params = {
+        "page": args.page,
+        "pageSize": args.limit,
+    }
+
+    result = api_request(instance, "wanted/cutoff", params=params)
+    records = result.get("records", [])
+
+    if not records:
+        print("No episodes below cutoff")
+        return
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"\n{'ID':<8} {'Series':<30} {'Episode':<10} {'Current':<15} {'Cutoff':<15}")
+    print("-" * 85)
+
+    for ep in records:
+        ep_id = ep.get("id", "")
+        series = truncate(ep.get("series", {}).get("title", "Unknown"), 29)
+        ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
+
+        current = "Unknown"
+        if ep.get("episodeFile"):
+            current = ep["episodeFile"].get("quality", {}).get("quality", {}).get("name", "Unknown")
+
+        cutoff = "Unknown"  # Would need to look up from quality profile
+
+        print(f"{ep_id:<8} {series:<30} {ep_str:<10} {current:<15} {cutoff:<15}")
+
+    total = result.get("totalRecords", len(records))
+    print(f"\nPage {args.page}: {len(records)} of {total} episodes below cutoff")
+
+
+# =============================================================================
+# HISTORY & IMPORT
+# =============================================================================
+
+def cmd_history(args, config):
+    """Show download history."""
+    instance = get_instance(config, args.instance)
+
+    params = {
+        "page": args.page,
+        "pageSize": args.limit,
+        "sortKey": "date",
+        "sortDirection": "descending",
+    }
+
+    if args.series_id:
+        params["seriesId"] = args.series_id
+
+    result = api_request(instance, "history", params=params)
+    records = result.get("records", [])
+
+    if not records:
+        print("No history")
+        return
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"\n{'Date':<18} {'Event':<15} {'Series':<30} {'Episode':<10} {'Quality':<12}")
+    print("-" * 90)
+
+    for h in records:
+        date = format_date(h.get("date"))
+        event = h.get("eventType", "unknown")
+        series = truncate(h.get("series", {}).get("title", "Unknown"), 29)
+        ep = h.get("episode", {})
+        ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
+        quality = h.get("quality", {}).get("quality", {}).get("name", "?")
+
+        print(f"{date:<18} {event:<15} {series:<30} {ep_str:<10} {quality:<12}")
+
+    total = result.get("totalRecords", len(records))
+    print(f"\nPage {args.page}: {len(records)} of {total} history items")
+
+
+def cmd_import(args, config):
+    """Manual import from path."""
+    instance = get_instance(config, args.instance)
+
+    # First, scan the path
+    params = {"folder": args.path}
+    if args.series_id:
+        params["seriesId"] = args.series_id
+
+    scan_result = api_request(instance, "manualimport", params=params)
+
+    if not scan_result:
+        print("No importable files found")
+        return
+
+    if args.json:
+        print(json.dumps(scan_result, indent=2))
+        return
+
+    print(f"\nFound {len(scan_result)} file(s) to import:")
+    print("-" * 80)
+
+    for i, item in enumerate(scan_result, 1):
+        path = item.get("path", "")
+        filename = Path(path).name if path else "Unknown"
+        series = item.get("series", {}).get("title", "Unknown")
+        episodes = item.get("episodes", [])
+
+        ep_str = ""
+        if episodes:
+            ep = episodes[0]
+            ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
+
+        quality = item.get("quality", {}).get("quality", {}).get("name", "?")
+
+        rejections = item.get("rejections", [])
+        status = "✓" if not rejections else f"✗ {rejections[0].get('reason', 'Rejected')}"
+
+        print(f"{i}. {truncate(filename, 50)}")
+        print(f"   Series: {series} {ep_str} [{quality}]")
+        print(f"   Status: {status}")
+        print()
+
+    if args.execute:
+        # Execute the import
+        import_data = []
+        for item in scan_result:
+            if not item.get("rejections"):
+                import_data.append({
+                    "path": item["path"],
+                    "seriesId": item.get("series", {}).get("id"),
+                    "episodeIds": [e["id"] for e in item.get("episodes", [])],
+                    "quality": item.get("quality"),
+                    "importMode": "move" if args.move else "copy",
+                })
+
+        if import_data:
+            api_request(instance, "command", method="POST", data={
+                "name": "ManualImport",
+                "files": import_data,
+                "importMode": "move" if args.move else "copy",
+            })
+            print(f"Import started for {len(import_data)} file(s)")
+        else:
+            print("No valid files to import")
+    else:
+        print("Use --execute to perform the import")
+
+
+# =============================================================================
+# QUALITY PROFILES
+# =============================================================================
+
+def cmd_profiles(args, config):
+    """List quality profiles."""
+    instance = get_instance(config, args.instance)
+
+    profiles = api_request(instance, "qualityprofile")
+
+    if args.json:
+        print(json.dumps(profiles, indent=2))
+        return
+
+    print(f"\n{'ID':<5} {'Name':<30} {'Cutoff':<20} {'Upgrade':<8}")
+    print("-" * 70)
+
+    for p in profiles:
+        p_id = p.get("id", "")
+        name = p.get("name", "")
+        cutoff = p.get("cutoff", {})
+        cutoff_name = cutoff.get("name", "Unknown") if isinstance(cutoff, dict) else str(cutoff)
+        upgrade = "Yes" if p.get("upgradeAllowed") else "No"
+
+        print(f"{p_id:<5} {name:<30} {cutoff_name:<20} {upgrade:<8}")
+
+
+def cmd_profile(args, config):
+    """View quality profile details."""
+    instance = get_instance(config, args.instance)
+
+    profile = api_request(instance, f"qualityprofile/{args.profile_id}")
+
+    if args.json:
+        print(json.dumps(profile, indent=2))
+        return
+
+    print(f"\n{profile.get('name', 'Unknown')}")
+    print("=" * 50)
+    print(f"ID:              {profile.get('id')}")
+    print(f"Upgrade Allowed: {'Yes' if profile.get('upgradeAllowed') else 'No'}")
+    print(f"Cutoff:          {profile.get('cutoff', {}).get('name', 'Unknown') if isinstance(profile.get('cutoff'), dict) else profile.get('cutoff')}")
+
+    print("\nQualities (highest to lowest):")
+    items = profile.get("items", [])
+    for item in reversed(items):
+        if item.get("allowed"):
+            name = item.get("name") or item.get("quality", {}).get("name", "Unknown")
+            print(f"  ✓ {name}")
+
+
+# =============================================================================
+# SYSTEM COMMANDS
+# =============================================================================
+
+def cmd_refresh(args, config):
+    """Refresh series metadata."""
+    instance = get_instance(config, args.instance)
+
+    data = {"name": "RefreshSeries"}
+    if args.series_id:
+        data["seriesId"] = args.series_id
+
+    result = api_request(instance, "command", method="POST", data=data)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        if args.series_id:
+            print(f"Refreshing series {args.series_id}...")
+        else:
+            print("Refreshing all series...")
+        print(f"Command ID: {result.get('id')}")
+
+
+def cmd_commands(args, config):
+    """View running commands."""
+    instance = get_instance(config, args.instance)
+
+    commands = api_request(instance, "command")
+
+    if not commands:
+        print("No running commands")
+        return
+
+    if args.json:
+        print(json.dumps(commands, indent=2))
+        return
+
+    print(f"\n{'ID':<6} {'Name':<25} {'Status':<12} {'Started':<18}")
+    print("-" * 65)
+
+    for cmd in commands:
+        cmd_id = cmd.get("id", "")
+        name = cmd.get("name", "Unknown")
+        status = cmd.get("status", "unknown")
+        started = format_date(cmd.get("started"))
+
+        print(f"{cmd_id:<6} {name:<25} {status:<12} {started:<18}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sonarr CLI - Manage TV series via Sonarr API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  snr series                      List all series
+  snr series --monitored          List monitored series only
+  snr search "Breaking Bad"       Search for a series
+  snr add 81189                   Add series by TVDB ID
+  snr info 1                      Show series details
+  snr episodes 1                  List episodes for series ID 1
+  snr episodes 1 -s 2             List season 2 episodes
+  snr episearch 123 --grab 1      Search releases for episode, grab #1
+  snr queue                       Show download queue
+  snr calendar                    Show upcoming episodes
+  snr wanted                      Show missing episodes
+  snr history                     Show download history
+  snr profiles                    List quality profiles
+  snr refresh                     Refresh all series
+  snr refresh 1                   Refresh specific series
+
+Multi-instance:
+  snr series -I 4k                Use '4k' instance
+  snr --instance main series      Use 'main' instance
+
+Config file: ~/.config/sonarr/config.json
+{
+  "default_instance": "main",
+  "default_root_folder": "/tv",
+  "default_quality_profile": "HD-1080p",
+  "instances": {
+    "main": {
+      "url": "http://localhost:8989",
+      "api_key": "your-api-key"
+    },
+    "4k": {
+      "url": "http://localhost:8990",
+      "api_key": "your-4k-api-key"
+    }
+  }
+}
+        """
+    )
+
+    # Global arguments
+    parser.add_argument("-j", "--json", action="store_true", help="Output as JSON")
+    parser.add_argument("-I", "--instance", help="Sonarr instance to use")
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # --- Series commands ---
+    series_p = subparsers.add_parser("series", aliases=["ls"], help="List all series")
+    series_p.add_argument("--monitored", action="store_true", help="Show monitored only")
+    series_p.add_argument("--unmonitored", action="store_true", help="Show unmonitored only")
+    series_p.add_argument("--continuing", action="store_true", help="Show continuing only")
+    series_p.add_argument("--ended", action="store_true", help="Show ended only")
+
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search for series")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add a series")
+    add_p.add_argument("tvdb_or_num", help="TVDB ID")
+    add_p.add_argument("-q", "--quality", help="Quality profile name or ID")
+    add_p.add_argument("-r", "--root", help="Root folder path")
+    add_p.add_argument("-m", "--monitor", choices=["all", "future", "missing", "existing", "pilot", "firstSeason", "latestSeason", "none"], default="all", help="Monitor mode")
+    add_p.add_argument("--search", action="store_true", help="Search for missing episodes")
+    add_p.add_argument("--unmonitored", action="store_true", help="Add as unmonitored")
+
+    info_p = subparsers.add_parser("info", aliases=["i"], help="Show series info")
+    info_p.add_argument("series_id", type=int, help="Series ID")
+
+    delete_p = subparsers.add_parser("delete", aliases=["rm"], help="Delete a series")
+    delete_p.add_argument("series_id", type=int, help="Series ID")
+    delete_p.add_argument("--delete-files", action="store_true", help="Also delete files")
+    delete_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+    # --- Episode commands ---
+    episodes_p = subparsers.add_parser("episodes", aliases=["ep"], help="List episodes")
+    episodes_p.add_argument("series_id", type=int, help="Series ID")
+    episodes_p.add_argument("-s", "--season", type=int, help="Filter by season")
+    episodes_p.add_argument("--missing", action="store_true", help="Show missing only")
+    episodes_p.add_argument("--downloaded", action="store_true", help="Show downloaded only")
+
+    episearch_p = subparsers.add_parser("episearch", aliases=["es"], help="Search episode releases")
+    episearch_p.add_argument("episode_id", type=int, help="Episode ID")
+    episearch_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+    episearch_p.add_argument("-g", "--grab", help="Grab release by number")
+
+    # --- Queue commands ---
+    queue_p = subparsers.add_parser("queue", aliases=["q"], help="Show download queue")
+    queue_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+
+    status_p = subparsers.add_parser("status", help="Show queue status")
+
+    grab_p = subparsers.add_parser("grab", help="Force grab queue item")
+    grab_p.add_argument("queue_id", type=int, help="Queue item ID")
+
+    remove_p = subparsers.add_parser("remove", help="Remove from queue")
+    remove_p.add_argument("queue_id", type=int, help="Queue item ID")
+    remove_p.add_argument("--from-client", action="store_true", help="Also remove from download client")
+    remove_p.add_argument("--blocklist", action="store_true", help="Add to blocklist")
+
+    # --- Calendar & Wanted ---
+    calendar_p = subparsers.add_parser("calendar", aliases=["cal"], help="Show upcoming episodes")
+    calendar_p.add_argument("-d", "--days", type=int, default=7, help="Days to show (default: 7)")
+    calendar_p.add_argument("--unmonitored", action="store_true", help="Include unmonitored")
+
+    wanted_p = subparsers.add_parser("wanted", aliases=["w"], help="Show missing episodes")
+    wanted_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+    wanted_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+
+    cutoff_p = subparsers.add_parser("cutoff", help="Show episodes below cutoff")
+    cutoff_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+    cutoff_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+
+    # --- History & Import ---
+    history_p = subparsers.add_parser("history", aliases=["h"], help="Show download history")
+    history_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+    history_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    history_p.add_argument("-s", "--series-id", type=int, help="Filter by series ID")
+
+    import_p = subparsers.add_parser("import", aliases=["im"], help="Manual import")
+    import_p.add_argument("path", help="Path to import from")
+    import_p.add_argument("-s", "--series-id", type=int, help="Target series ID")
+    import_p.add_argument("--execute", action="store_true", help="Execute the import")
+    import_p.add_argument("--move", action="store_true", help="Move files instead of copy")
+
+    # --- Quality Profiles ---
+    profiles_p = subparsers.add_parser("profiles", aliases=["qp"], help="List quality profiles")
+
+    profile_p = subparsers.add_parser("profile", help="View quality profile")
+    profile_p.add_argument("profile_id", type=int, help="Profile ID")
+
+    # --- System ---
+    refresh_p = subparsers.add_parser("refresh", aliases=["r"], help="Refresh series")
+    refresh_p.add_argument("series_id", type=int, nargs="?", help="Series ID (optional, refreshes all if omitted)")
+
+    commands_p = subparsers.add_parser("commands", help="View running commands")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    # Add instance from args to make it accessible
+    if hasattr(args, "instance") and args.instance is None:
+        args.instance = None
+
+    cmd_map = {
+        "series": cmd_series, "ls": cmd_series,
+        "search": cmd_search, "s": cmd_search,
+        "add": cmd_add, "a": cmd_add,
+        "info": cmd_info, "i": cmd_info,
+        "delete": cmd_delete, "rm": cmd_delete,
+        "episodes": cmd_episodes, "ep": cmd_episodes,
+        "episearch": cmd_episearch, "es": cmd_episearch,
+        "queue": cmd_queue, "q": cmd_queue,
+        "status": cmd_status,
+        "grab": cmd_grab,
+        "remove": cmd_remove,
+        "calendar": cmd_calendar, "cal": cmd_calendar,
+        "wanted": cmd_wanted, "w": cmd_wanted,
+        "cutoff": cmd_cutoff,
+        "history": cmd_history, "h": cmd_history,
+        "import": cmd_import, "im": cmd_import,
+        "profiles": cmd_profiles, "qp": cmd_profiles,
+        "profile": cmd_profile,
+        "refresh": cmd_refresh, "r": cmd_refresh,
+        "commands": cmd_commands,
+    }
+
+    if args.command in cmd_map:
+        cmd_map[args.command](args, config)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
