@@ -150,13 +150,19 @@ class TransmissionClient(TorrentClient):
         normalized = []
         for t in torrents:
             status_code = t["status"]
+            has_error = t["error"] != 0
+
             if filter_type == "downloading" and status_code != 4:
                 continue
             if filter_type == "seeding" and status_code != 6:
                 continue
             if filter_type == "paused" and status_code != 0:
                 continue
+            if filter_type == "stopped" and status_code != 0:
+                continue
             if filter_type == "active" and t["rateDownload"] <= 0 and t["rateUpload"] <= 0:
+                continue
+            if filter_type == "error" and not has_error:
                 continue
 
             normalized.append({
@@ -164,7 +170,9 @@ class TransmissionClient(TorrentClient):
                 "name": t["name"],
                 "size": t["totalSize"],
                 "progress": t["percentDone"],
-                "status": t["errorString"] if t["error"] else self.STATUS_MAP.get(status_code, "?"),
+                "status": t["errorString"][:20] if has_error else self.STATUS_MAP.get(status_code, "?"),
+                "has_error": has_error,
+                "error_string": t["errorString"] if has_error else "",
                 "down_speed": t["rateDownload"],
                 "up_speed": t["rateUpload"],
                 "eta": t["eta"],
@@ -325,6 +333,7 @@ class QBittorrentClient(TorrentClient):
 
     def list_torrents(self, filter_type=None):
         params = {}
+        # qBittorrent has built-in filters for some states
         if filter_type == "downloading":
             params["filter"] = "downloading"
         elif filter_type == "seeding":
@@ -333,12 +342,25 @@ class QBittorrentClient(TorrentClient):
             params["filter"] = "paused"
         elif filter_type == "active":
             params["filter"] = "active"
+        elif filter_type == "error":
+            params["filter"] = "errored"
+        elif filter_type == "stopped":
+            params["filter"] = "paused"
 
         torrents = self._request("torrents/info", params)
+
+        error_states = {"error", "missingFiles"}
+        stopped_states = {"pausedDL", "pausedUP", "error", "missingFiles"}
 
         normalized = []
         for t in torrents:
             state = t["state"]
+            has_error = state in error_states
+
+            # Additional filtering for error (missing files specifically)
+            if filter_type == "error" and state not in error_states:
+                continue
+
             status_map = {
                 "downloading": "Downloading",
                 "stalledDL": "Stalled DL",
@@ -351,7 +373,7 @@ class QBittorrentClient(TorrentClient):
                 "checkingDL": "Checking",
                 "checkingUP": "Checking",
                 "error": "Error",
-                "missingFiles": "Missing",
+                "missingFiles": "Missing Files",
                 "moving": "Moving",
             }
             normalized.append({
@@ -361,6 +383,8 @@ class QBittorrentClient(TorrentClient):
                 "size": t["total_size"],
                 "progress": t["progress"],
                 "status": status_map.get(state, state),
+                "has_error": has_error,
+                "error_string": "Torrent missing files" if state == "missingFiles" else ("Error" if state == "error" else ""),
                 "down_speed": t["dlspeed"],
                 "up_speed": t["upspeed"],
                 "eta": t.get("eta", -1),
@@ -561,18 +585,23 @@ def list_cmd(args, client):
         filter_type = "paused"
     elif args.active:
         filter_type = "active"
+    elif args.error:
+        filter_type = "error"
+    elif args.stopped:
+        filter_type = "stopped"
 
     torrents = client.list_torrents(filter_type)
 
     if not torrents:
-        print("No torrents")
+        print("No torrents" + (f" with filter '{filter_type}'" if filter_type else ""))
         return
 
-    print(f"\n{'ID':>8} {'Name':<45} {'Size':>9} {'Done':>6} {'Status':<12} {'Down':>9} {'Up':>9}")
-    print("-" * 109)
+    print(f"\n{'ID':>8} {'Name':<45} {'Size':>9} {'Done':>6} {'Status':<14} {'Down':>9} {'Up':>9}")
+    print("-" * 111)
 
     total_down = 0
     total_up = 0
+    error_count = 0
 
     for t in torrents:
         name = t["name"][:44]
@@ -580,9 +609,18 @@ def list_cmd(args, client):
         total_down += t["down_speed"]
         total_up += t["up_speed"]
 
-        print(f"{t['id']:>8} {name:<45} {format_size(t['size']):>9} {pct:>6} {t['status']:<12} {format_speed(t['down_speed']):>9} {format_speed(t['up_speed']):>9}")
+        status = t["status"][:14]
+        if t.get("has_error"):
+            error_count += 1
+            status = f"*{status}"  # Mark errors with asterisk
 
-    print(f"\n{len(torrents)} torrents | Down: {format_speed(total_down)} | Up: {format_speed(total_up)}")
+        print(f"{t['id']:>8} {name:<45} {format_size(t['size']):>9} {pct:>6} {status:<14} {format_speed(t['down_speed']):>9} {format_speed(t['up_speed']):>9}")
+
+    summary = f"\n{len(torrents)} torrents"
+    if error_count > 0:
+        summary += f" ({error_count} errored)"
+    summary += f" | Down: {format_speed(total_down)} | Up: {format_speed(total_up)}"
+    print(summary)
 
 def info_cmd(args, client):
     t = client.get_torrent_info(args.id)
@@ -698,6 +736,8 @@ def main():
 Examples:
   trt list                           # List all torrents
   trt list -d                        # Show only downloading
+  trt list -e                        # Show errored (missing files, tracker issues)
+  trt list -x                        # Show stopped/paused
   trt info 5                         # Details for torrent ID 5
   trt add magnet:?xt=...             # Add magnet link
   trt add file.torrent               # Add torrent file
@@ -724,6 +764,8 @@ Config:   ~/.config/torrent/config.json
     list_p.add_argument("-s", "--seeding", action="store_true", help="Seeding only")
     list_p.add_argument("-p", "--paused", action="store_true", help="Paused only")
     list_p.add_argument("-a", "--active", action="store_true", help="Active only")
+    list_p.add_argument("-e", "--error", action="store_true", help="Errored only (missing files, tracker errors)")
+    list_p.add_argument("-x", "--stopped", action="store_true", help="Stopped/paused only")
 
     # Info
     info_p = subparsers.add_parser("info", aliases=["i"], help="Torrent details")
