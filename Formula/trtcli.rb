@@ -2,8 +2,8 @@ class Trtcli < Formula
   desc "Torrent CLI - Control Transmission or qBittorrent from the command line"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/trtcli"
-  version "1.0.0"
-  sha256 "f7fbfa4efa7344f88b036c77b23331768de7c26e305dfb2dbd2f0a2e75d54772"
+  version "1.1.0"
+  sha256 "e492e6ec9611e7429b90e9bdd6841335d5e485f502b8314eabfea8b488fef5e2"
   license "MIT"
 
   depends_on "python@3"
@@ -35,6 +35,8 @@ class Trtcli < Formula
       Usage:
         trt list                  List all torrents
         trt list -d               Show downloading only
+        trt list -e               Show errored (missing files)
+        trt list -x               Show stopped/paused
         trt add magnet:?xt=...    Add magnet link
         trt add file.torrent      Add torrent file
         trt remove 1 2 3          Remove torrents
