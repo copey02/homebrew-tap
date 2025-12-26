@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+Torrent CLI - Control Transmission or qBittorrent from the command line
+"""
+
+import argparse
+import json
+import sys
+import urllib.request
+import urllib.parse
+import http.cookiejar
+from pathlib import Path
+from abc import ABC, abstractmethod
+
+CONFIG_PATH = Path.home() / ".config" / "torrent" / "config.json"
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config not found at {CONFIG_PATH}")
+        print("Create it with: client, url, username, password")
+        print("  client: 'transmission' or 'qbittorrent'")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def format_size(bytes_val):
+    if bytes_val < 0:
+        return "-"
+    gb = bytes_val / 1024 / 1024 / 1024
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = bytes_val / 1024 / 1024
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    kb = bytes_val / 1024
+    return f"{kb:.1f} KB"
+
+def format_speed(bytes_per_sec):
+    if bytes_per_sec <= 0:
+        return "-"
+    mb = bytes_per_sec / 1024 / 1024
+    if mb >= 1:
+        return f"{mb:.1f} MB/s"
+    kb = bytes_per_sec / 1024
+    return f"{kb:.1f} KB/s"
+
+def format_eta(seconds):
+    if seconds < 0:
+        return "-"
+    if seconds == 0:
+        return "Done"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{int(hours)}h {int(minutes)}m"
+    if minutes > 0:
+        return f"{int(minutes)}m {int(secs)}s"
+    return f"{int(secs)}s"
+
+
+class TorrentClient(ABC):
+    """Abstract base class for torrent clients"""
+
+    @abstractmethod
+    def list_torrents(self, filter_type=None):
+        pass
+
+    @abstractmethod
+    def get_torrent_info(self, torrent_id):
+        pass
+
+    @abstractmethod
+    def add_torrent(self, source, paused=False, download_dir=None):
+        pass
+
+    @abstractmethod
+    def remove_torrents(self, ids, delete_data=False):
+        pass
+
+    @abstractmethod
+    def start_torrents(self, ids=None):
+        pass
+
+    @abstractmethod
+    def stop_torrents(self, ids=None):
+        pass
+
+    @abstractmethod
+    def get_stats(self):
+        pass
+
+    @abstractmethod
+    def set_speed_limits(self, down=None, up=None):
+        pass
+
+    @abstractmethod
+    def get_speed_limits(self):
+        pass
+
+
+class TransmissionClient(TorrentClient):
+    STATUS_MAP = {
+        0: "Stopped",
+        1: "Check Queue",
+        2: "Checking",
+        3: "DL Queue",
+        4: "Downloading",
+        5: "Seed Queue",
+        6: "Seeding",
+    }
+
+    def __init__(self, config):
+        self.config = config
+        self.url = config.get("url", "http://localhost:9091/transmission/rpc")
+        self.session_id = None
+
+    def _request(self, method, arguments):
+        headers = {"Content-Type": "application/json"}
+
+        if self.config.get("username") and self.config.get("password"):
+            import base64
+            creds = base64.b64encode(f"{self.config['username']}:{self.config['password']}".encode()).decode()
+            headers["Authorization"] = f"Basic {creds}"
+
+        if self.session_id:
+            headers["X-Transmission-Session-Id"] = self.session_id
+
+        payload = json.dumps({"method": method, "arguments": arguments}).encode()
+        req = urllib.request.Request(self.url, data=payload, headers=headers)
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                self.session_id = e.headers.get("X-Transmission-Session-Id")
+                if self.session_id:
+                    headers["X-Transmission-Session-Id"] = self.session_id
+                    req = urllib.request.Request(self.url, data=payload, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        return json.loads(resp.read().decode())
+            raise
+
+    def list_torrents(self, filter_type=None):
+        fields = ["id", "name", "status", "totalSize", "percentDone",
+                  "rateDownload", "rateUpload", "eta", "uploadRatio", "error", "errorString"]
+        result = self._request("torrent-get", {"fields": fields})
+        torrents = result.get("arguments", {}).get("torrents", [])
+
+        normalized = []
+        for t in torrents:
+            status_code = t["status"]
+            if filter_type == "downloading" and status_code != 4:
+                continue
+            if filter_type == "seeding" and status_code != 6:
+                continue
+            if filter_type == "paused" and status_code != 0:
+                continue
+            if filter_type == "active" and t["rateDownload"] <= 0 and t["rateUpload"] <= 0:
+                continue
+
+            normalized.append({
+                "id": t["id"],
+                "name": t["name"],
+                "size": t["totalSize"],
+                "progress": t["percentDone"],
+                "status": t["errorString"] if t["error"] else self.STATUS_MAP.get(status_code, "?"),
+                "down_speed": t["rateDownload"],
+                "up_speed": t["rateUpload"],
+                "eta": t["eta"],
+                "ratio": t["uploadRatio"],
+            })
+        return normalized
+
+    def get_torrent_info(self, torrent_id):
+        fields = ["id", "name", "status", "hashString", "totalSize", "percentDone",
+                  "downloadedEver", "uploadedEver", "uploadRatio", "rateDownload", "rateUpload",
+                  "eta", "addedDate", "doneDate", "downloadDir", "error", "errorString",
+                  "peersConnected", "comment", "magnetLink"]
+        result = self._request("torrent-get", {"ids": [torrent_id], "fields": fields})
+        torrents = result.get("arguments", {}).get("torrents", [])
+        if not torrents:
+            return None
+        t = torrents[0]
+        return {
+            "id": t["id"],
+            "name": t["name"],
+            "hash": t["hashString"],
+            "size": t["totalSize"],
+            "progress": t["percentDone"],
+            "status": self.STATUS_MAP.get(t["status"], "?"),
+            "downloaded": t["downloadedEver"],
+            "uploaded": t["uploadedEver"],
+            "ratio": t["uploadRatio"],
+            "down_speed": t["rateDownload"],
+            "up_speed": t["rateUpload"],
+            "eta": t["eta"],
+            "peers": t["peersConnected"],
+            "location": t["downloadDir"],
+            "comment": t.get("comment", ""),
+            "magnet": t.get("magnetLink", ""),
+        }
+
+    def add_torrent(self, source, paused=False, download_dir=None):
+        add_args = {}
+        if source.startswith("magnet:") or source.startswith("http"):
+            add_args["filename"] = source
+        else:
+            import base64
+            path = Path(source).expanduser()
+            if not path.exists():
+                return None, f"File not found: {source}"
+            with open(path, "rb") as f:
+                add_args["metainfo"] = base64.b64encode(f.read()).decode()
+
+        if paused:
+            add_args["paused"] = True
+        if download_dir:
+            add_args["download-dir"] = download_dir
+
+        result = self._request("torrent-add", add_args)
+        resp = result.get("arguments", {})
+
+        if "torrent-added" in resp:
+            t = resp["torrent-added"]
+            return t["id"], t["name"]
+        elif "torrent-duplicate" in resp:
+            t = resp["torrent-duplicate"]
+            return t["id"], f"Duplicate: {t['name']}"
+        return None, "Failed to add torrent"
+
+    def remove_torrents(self, ids, delete_data=False):
+        result = self._request("torrent-remove", {"ids": ids, "delete-local-data": delete_data})
+        return result.get("result") == "success"
+
+    def start_torrents(self, ids=None):
+        req_args = {"ids": ids} if ids else {}
+        result = self._request("torrent-start", req_args)
+        return result.get("result") == "success"
+
+    def stop_torrents(self, ids=None):
+        req_args = {"ids": ids} if ids else {}
+        result = self._request("torrent-stop", req_args)
+        return result.get("result") == "success"
+
+    def get_stats(self):
+        result = self._request("session-stats", {})
+        s = result.get("arguments", {})
+        return {
+            "active": s.get("activeTorrentCount", 0),
+            "paused": s.get("pausedTorrentCount", 0),
+            "total": s.get("torrentCount", 0),
+            "down_speed": s.get("downloadSpeed", 0),
+            "up_speed": s.get("uploadSpeed", 0),
+            "session_downloaded": s.get("current-stats", {}).get("downloadedBytes", 0),
+            "session_uploaded": s.get("current-stats", {}).get("uploadedBytes", 0),
+            "total_downloaded": s.get("cumulative-stats", {}).get("downloadedBytes", 0),
+            "total_uploaded": s.get("cumulative-stats", {}).get("uploadedBytes", 0),
+        }
+
+    def set_speed_limits(self, down=None, up=None):
+        set_args = {}
+        if down is not None:
+            set_args["speed-limit-down"] = down
+            set_args["speed-limit-down-enabled"] = down > 0
+        if up is not None:
+            set_args["speed-limit-up"] = up
+            set_args["speed-limit-up-enabled"] = up > 0
+        self._request("session-set", set_args)
+
+    def get_speed_limits(self):
+        result = self._request("session-get", {})
+        s = result.get("arguments", {})
+        return {
+            "down_limit": s.get("speed-limit-down", 0) if s.get("speed-limit-down-enabled") else 0,
+            "up_limit": s.get("speed-limit-up", 0) if s.get("speed-limit-up-enabled") else 0,
+            "down_enabled": s.get("speed-limit-down-enabled", False),
+            "up_enabled": s.get("speed-limit-up-enabled", False),
+        }
+
+
+class QBittorrentClient(TorrentClient):
+    def __init__(self, config):
+        self.config = config
+        self.url = config.get("url", "http://localhost:8080").rstrip("/")
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
+        self._logged_in = False
+
+    def _login(self):
+        if self._logged_in:
+            return
+        login_url = f"{self.url}/api/v2/auth/login"
+        data = urllib.parse.urlencode({
+            "username": self.config.get("username", "admin"),
+            "password": self.config.get("password", ""),
+        }).encode()
+        req = urllib.request.Request(login_url, data=data)
+        with self.opener.open(req, timeout=30) as resp:
+            result = resp.read().decode()
+            if result != "Ok.":
+                raise Exception(f"Login failed: {result}")
+        self._logged_in = True
+
+    def _request(self, endpoint, data=None, method="GET"):
+        self._login()
+        url = f"{self.url}/api/v2/{endpoint}"
+
+        if data and method == "GET":
+            url = f"{url}?{urllib.parse.urlencode(data)}"
+            req = urllib.request.Request(url)
+        elif data:
+            req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode())
+        else:
+            req = urllib.request.Request(url)
+
+        with self.opener.open(req, timeout=30) as resp:
+            content = resp.read().decode()
+            if content:
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    return content
+            return None
+
+    def list_torrents(self, filter_type=None):
+        params = {}
+        if filter_type == "downloading":
+            params["filter"] = "downloading"
+        elif filter_type == "seeding":
+            params["filter"] = "seeding"
+        elif filter_type == "paused":
+            params["filter"] = "paused"
+        elif filter_type == "active":
+            params["filter"] = "active"
+
+        torrents = self._request("torrents/info", params)
+
+        normalized = []
+        for t in torrents:
+            state = t["state"]
+            status_map = {
+                "downloading": "Downloading",
+                "stalledDL": "Stalled DL",
+                "uploading": "Seeding",
+                "stalledUP": "Seeding",
+                "pausedDL": "Paused",
+                "pausedUP": "Paused",
+                "queuedDL": "Queued",
+                "queuedUP": "Queued",
+                "checkingDL": "Checking",
+                "checkingUP": "Checking",
+                "error": "Error",
+                "missingFiles": "Missing",
+                "moving": "Moving",
+            }
+            normalized.append({
+                "id": t["hash"][:8],
+                "hash": t["hash"],
+                "name": t["name"],
+                "size": t["total_size"],
+                "progress": t["progress"],
+                "status": status_map.get(state, state),
+                "down_speed": t["dlspeed"],
+                "up_speed": t["upspeed"],
+                "eta": t.get("eta", -1),
+                "ratio": t["ratio"],
+            })
+        return normalized
+
+    def get_torrent_info(self, torrent_id):
+        torrents = self._request("torrents/info")
+        t = None
+        for torrent in torrents:
+            if torrent["hash"].startswith(torrent_id) or torrent["hash"] == torrent_id:
+                t = torrent
+                break
+        if not t:
+            return None
+
+        props = self._request("torrents/properties", {"hash": t["hash"]})
+
+        return {
+            "id": t["hash"][:8],
+            "hash": t["hash"],
+            "name": t["name"],
+            "size": t["total_size"],
+            "progress": t["progress"],
+            "status": t["state"],
+            "downloaded": props.get("total_downloaded", 0),
+            "uploaded": props.get("total_uploaded", 0),
+            "ratio": t["ratio"],
+            "down_speed": t["dlspeed"],
+            "up_speed": t["upspeed"],
+            "eta": t.get("eta", -1),
+            "peers": props.get("peers", 0),
+            "location": t["save_path"],
+            "comment": props.get("comment", ""),
+            "magnet": t.get("magnet_uri", ""),
+        }
+
+    def add_torrent(self, source, paused=False, download_dir=None):
+        self._login()
+
+        if source.startswith("magnet:") or source.startswith("http"):
+            data = {"urls": source}
+            if paused:
+                data["paused"] = "true"
+            if download_dir:
+                data["savepath"] = download_dir
+            result = self._request("torrents/add", data, method="POST")
+            if result == "Ok." or result is None:
+                return "added", source[:50]
+            return None, str(result)
+        else:
+            # File upload requires multipart
+            path = Path(source).expanduser()
+            if not path.exists():
+                return None, f"File not found: {source}"
+
+            boundary = "----PythonBoundary"
+            body = []
+            body.append(f"--{boundary}".encode())
+            body.append(f'Content-Disposition: form-data; name="torrents"; filename="{path.name}"'.encode())
+            body.append(b"Content-Type: application/x-bittorrent")
+            body.append(b"")
+            with open(path, "rb") as f:
+                body.append(f.read())
+
+            if paused:
+                body.append(f"--{boundary}".encode())
+                body.append(b'Content-Disposition: form-data; name="paused"')
+                body.append(b"")
+                body.append(b"true")
+
+            if download_dir:
+                body.append(f"--{boundary}".encode())
+                body.append(b'Content-Disposition: form-data; name="savepath"')
+                body.append(b"")
+                body.append(download_dir.encode())
+
+            body.append(f"--{boundary}--".encode())
+            body_data = b"\r\n".join(body)
+
+            req = urllib.request.Request(
+                f"{self.url}/api/v2/torrents/add",
+                data=body_data,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+            )
+            with self.opener.open(req, timeout=30) as resp:
+                result = resp.read().decode()
+
+            if result == "Ok." or not result:
+                return "added", path.name
+            return None, result
+
+    def remove_torrents(self, ids, delete_data=False):
+        # Convert short IDs to full hashes
+        torrents = self._request("torrents/info")
+        hashes = []
+        for tid in ids:
+            tid_str = str(tid)
+            for t in torrents:
+                if t["hash"].startswith(tid_str) or t["hash"] == tid_str:
+                    hashes.append(t["hash"])
+                    break
+
+        if not hashes:
+            return False
+
+        self._request("torrents/delete", {
+            "hashes": "|".join(hashes),
+            "deleteFiles": "true" if delete_data else "false"
+        }, method="POST")
+        return True
+
+    def start_torrents(self, ids=None):
+        if ids is None:
+            self._request("torrents/resume", {"hashes": "all"}, method="POST")
+        else:
+            torrents = self._request("torrents/info")
+            hashes = []
+            for tid in ids:
+                tid_str = str(tid)
+                for t in torrents:
+                    if t["hash"].startswith(tid_str) or t["hash"] == tid_str:
+                        hashes.append(t["hash"])
+                        break
+            if hashes:
+                self._request("torrents/resume", {"hashes": "|".join(hashes)}, method="POST")
+        return True
+
+    def stop_torrents(self, ids=None):
+        if ids is None:
+            self._request("torrents/pause", {"hashes": "all"}, method="POST")
+        else:
+            torrents = self._request("torrents/info")
+            hashes = []
+            for tid in ids:
+                tid_str = str(tid)
+                for t in torrents:
+                    if t["hash"].startswith(tid_str) or t["hash"] == tid_str:
+                        hashes.append(t["hash"])
+                        break
+            if hashes:
+                self._request("torrents/pause", {"hashes": "|".join(hashes)}, method="POST")
+        return True
+
+    def get_stats(self):
+        info = self._request("transfer/info")
+        torrents = self._request("torrents/info")
+
+        active = sum(1 for t in torrents if t["state"] in ["downloading", "uploading", "stalledDL", "stalledUP"])
+        paused = sum(1 for t in torrents if t["state"] in ["pausedDL", "pausedUP"])
+
+        return {
+            "active": active,
+            "paused": paused,
+            "total": len(torrents),
+            "down_speed": info.get("dl_info_speed", 0),
+            "up_speed": info.get("up_info_speed", 0),
+            "session_downloaded": info.get("dl_info_data", 0),
+            "session_uploaded": info.get("up_info_data", 0),
+            "total_downloaded": info.get("alltime_dl", 0),
+            "total_uploaded": info.get("alltime_ul", 0),
+        }
+
+    def set_speed_limits(self, down=None, up=None):
+        prefs = {}
+        if down is not None:
+            prefs["dl_limit"] = down * 1024 if down > 0 else 0
+        if up is not None:
+            prefs["up_limit"] = up * 1024 if up > 0 else 0
+        self._request("app/setPreferences", {"json": json.dumps(prefs)}, method="POST")
+
+    def get_speed_limits(self):
+        prefs = self._request("app/preferences")
+        return {
+            "down_limit": prefs.get("dl_limit", 0) // 1024,
+            "up_limit": prefs.get("up_limit", 0) // 1024,
+            "down_enabled": prefs.get("dl_limit", 0) > 0,
+            "up_enabled": prefs.get("up_limit", 0) > 0,
+        }
+
+
+def get_client(config):
+    client_type = config.get("client", "transmission").lower()
+    if client_type == "qbittorrent" or client_type == "qbit":
+        return QBittorrentClient(config)
+    return TransmissionClient(config)
+
+
+# Command handlers
+def list_cmd(args, client):
+    filter_type = None
+    if args.downloading:
+        filter_type = "downloading"
+    elif args.seeding:
+        filter_type = "seeding"
+    elif args.paused:
+        filter_type = "paused"
+    elif args.active:
+        filter_type = "active"
+
+    torrents = client.list_torrents(filter_type)
+
+    if not torrents:
+        print("No torrents")
+        return
+
+    print(f"\n{'ID':>8} {'Name':<45} {'Size':>9} {'Done':>6} {'Status':<12} {'Down':>9} {'Up':>9}")
+    print("-" * 109)
+
+    total_down = 0
+    total_up = 0
+
+    for t in torrents:
+        name = t["name"][:44]
+        pct = f"{t['progress']*100:.0f}%"
+        total_down += t["down_speed"]
+        total_up += t["up_speed"]
+
+        print(f"{t['id']:>8} {name:<45} {format_size(t['size']):>9} {pct:>6} {t['status']:<12} {format_speed(t['down_speed']):>9} {format_speed(t['up_speed']):>9}")
+
+    print(f"\n{len(torrents)} torrents | Down: {format_speed(total_down)} | Up: {format_speed(total_up)}")
+
+def info_cmd(args, client):
+    t = client.get_torrent_info(args.id)
+    if not t:
+        print(f"Torrent {args.id} not found")
+        return
+
+    print(f"\n{t['name']}")
+    print("-" * 60)
+    print(f"ID:         {t['id']}")
+    print(f"Hash:       {t['hash']}")
+    print(f"Status:     {t['status']}")
+    print(f"Size:       {format_size(t['size'])}")
+    print(f"Progress:   {t['progress']*100:.1f}%")
+    print(f"Downloaded: {format_size(t['downloaded'])}")
+    print(f"Uploaded:   {format_size(t['uploaded'])}")
+    print(f"Ratio:      {t['ratio']:.2f}" if t['ratio'] >= 0 else "Ratio:      -")
+    print(f"Down Speed: {format_speed(t['down_speed'])}")
+    print(f"Up Speed:   {format_speed(t['up_speed'])}")
+    print(f"ETA:        {format_eta(t['eta'])}")
+    print(f"Peers:      {t['peers']}")
+    print(f"Location:   {t['location']}")
+    if t.get('comment'):
+        print(f"Comment:    {t['comment'][:60]}")
+
+    if args.magnet and t.get('magnet'):
+        print(f"\nMagnet: {t['magnet']}")
+
+def add_cmd(args, client):
+    result_id, msg = client.add_torrent(args.source, args.paused, args.download_dir)
+    if result_id:
+        print(f"Added: {msg}")
+    else:
+        print(f"Failed: {msg}")
+
+def remove_cmd(args, client):
+    if client.remove_torrents(args.ids, args.delete_data):
+        print(f"Removed {len(args.ids)} torrent(s)" + (" and data" if args.delete_data else ""))
+    else:
+        print("Failed to remove torrents")
+
+def start_cmd(args, client):
+    ids = None if args.ids == ["all"] else args.ids
+    if client.start_torrents(ids):
+        print(f"Started {'all torrents' if ids is None else f'{len(ids)} torrent(s)'}")
+
+def stop_cmd(args, client):
+    ids = None if args.ids == ["all"] else args.ids
+    if client.stop_torrents(ids):
+        print(f"Stopped {'all torrents' if ids is None else f'{len(ids)} torrent(s)'}")
+
+def stats_cmd(args, client):
+    s = client.get_stats()
+
+    print(f"\nActive:     {s['active']} torrents")
+    print(f"Paused:     {s['paused']} torrents")
+    print(f"Total:      {s['total']} torrents")
+    print(f"Down Speed: {format_speed(s['down_speed'])}")
+    print(f"Up Speed:   {format_speed(s['up_speed'])}")
+
+    print(f"\nThis Session:")
+    print(f"  Downloaded: {format_size(s['session_downloaded'])}")
+    print(f"  Uploaded:   {format_size(s['session_uploaded'])}")
+
+    print(f"\nAll Time:")
+    print(f"  Downloaded: {format_size(s['total_downloaded'])}")
+    print(f"  Uploaded:   {format_size(s['total_uploaded'])}")
+
+def speed_cmd(args, client):
+    if args.down is not None or args.up is not None:
+        client.set_speed_limits(args.down, args.up)
+        print("Speed limits updated")
+    else:
+        limits = client.get_speed_limits()
+        print(f"Download: {limits['down_limit']} KB/s" if limits['down_enabled'] else "Download: unlimited")
+        print(f"Upload:   {limits['up_limit']} KB/s" if limits['up_enabled'] else "Upload:   unlimited")
+
+def watch_cmd(args, client):
+    import time
+
+    try:
+        while True:
+            s = client.get_stats()
+            print(f"\rActive: {s['active']} | Down: {format_speed(s['down_speed'])} | Up: {format_speed(s['up_speed'])}    ", end="", flush=True)
+
+            if s['active'] == 0:
+                print("\nAll done!")
+                break
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped")
+
+def parse_ids(id_args):
+    ids = []
+    for arg in id_args:
+        if arg.lower() == "all":
+            return ["all"]
+        if "-" in arg and not arg.startswith("-") and arg[0].isdigit():
+            start, end = map(int, arg.split("-"))
+            ids.extend(range(start, end + 1))
+        elif arg.isdigit():
+            ids.append(int(arg))
+        else:
+            ids.append(arg)  # Hash string
+    return ids
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Torrent CLI - Control Transmission or qBittorrent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  trt list                           # List all torrents
+  trt list -d                        # Show only downloading
+  trt info 5                         # Details for torrent ID 5
+  trt add magnet:?xt=...             # Add magnet link
+  trt add file.torrent               # Add torrent file
+  trt remove 1 2 3                   # Remove torrents
+  trt remove abc123 --delete-data    # Remove by hash with data
+  trt start 1 2 3                    # Start specific torrents
+  trt start all                      # Start all
+  trt stop all                       # Stop all
+  trt stats                          # Session statistics
+  trt speed                          # Show speed limits
+  trt speed -d 5000 -u 1000          # Set limits (KB/s, 0=unlimited)
+  trt watch                          # Watch until downloads complete
+
+Supports: Transmission, qBittorrent
+Config:   ~/.config/torrent/config.json
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # List
+    list_p = subparsers.add_parser("list", aliases=["ls", "l"], help="List torrents")
+    list_p.add_argument("-d", "--downloading", action="store_true", help="Downloading only")
+    list_p.add_argument("-s", "--seeding", action="store_true", help="Seeding only")
+    list_p.add_argument("-p", "--paused", action="store_true", help="Paused only")
+    list_p.add_argument("-a", "--active", action="store_true", help="Active only")
+
+    # Info
+    info_p = subparsers.add_parser("info", aliases=["i"], help="Torrent details")
+    info_p.add_argument("id", help="Torrent ID or hash")
+    info_p.add_argument("-m", "--magnet", action="store_true", help="Show magnet link")
+
+    # Add
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add torrent")
+    add_p.add_argument("source", help="Magnet link, URL, or .torrent file")
+    add_p.add_argument("-p", "--paused", action="store_true", help="Add paused")
+    add_p.add_argument("-d", "--download-dir", help="Download directory")
+
+    # Remove
+    rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove torrents")
+    rm_p.add_argument("ids", nargs="+", help="Torrent IDs or hashes")
+    rm_p.add_argument("--delete-data", action="store_true", help="Delete downloaded data")
+
+    # Start
+    start_p = subparsers.add_parser("start", aliases=["st"], help="Start torrents")
+    start_p.add_argument("ids", nargs="+", help="Torrent IDs or 'all'")
+
+    # Stop
+    stop_p = subparsers.add_parser("stop", aliases=["sp"], help="Stop torrents")
+    stop_p.add_argument("ids", nargs="+", help="Torrent IDs or 'all'")
+
+    # Stats
+    subparsers.add_parser("stats", aliases=["s"], help="Session statistics")
+
+    # Speed
+    speed_p = subparsers.add_parser("speed", help="Get/set speed limits")
+    speed_p.add_argument("-d", "--down", type=int, help="Download limit KB/s (0=unlimited)")
+    speed_p.add_argument("-u", "--up", type=int, help="Upload limit KB/s (0=unlimited)")
+
+    # Watch
+    watch_p = subparsers.add_parser("watch", aliases=["w"], help="Watch until complete")
+    watch_p.add_argument("-i", "--interval", type=int, default=5, help="Update interval (seconds)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+    client = get_client(config)
+
+    # Parse IDs for commands that need them
+    if hasattr(args, 'ids') and args.ids:
+        args.ids = parse_ids(args.ids)
+
+    cmd_map = {
+        "list": list_cmd, "ls": list_cmd, "l": list_cmd,
+        "info": info_cmd, "i": info_cmd,
+        "add": add_cmd, "a": add_cmd,
+        "remove": remove_cmd, "rm": remove_cmd,
+        "start": start_cmd, "st": start_cmd,
+        "stop": stop_cmd, "sp": stop_cmd,
+        "stats": stats_cmd, "s": stats_cmd,
+        "speed": speed_cmd,
+        "watch": watch_cmd, "w": watch_cmd,
+    }
+
+    if args.command in cmd_map:
+        try:
+            cmd_map[args.command](args, client)
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
