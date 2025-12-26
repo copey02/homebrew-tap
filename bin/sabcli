@@ -104,39 +104,60 @@ def history(args, config):
     print()
 
 def add(args, config):
-    for nzb_path in args.files:
-        path = Path(nzb_path).expanduser().resolve()
-        if not path.exists():
-            print(f"File not found: {nzb_path}")
-            continue
+    for item in args.items:
+        # Check if it's a URL
+        if item.startswith("http://") or item.startswith("https://"):
+            # Add via URL
+            params = {
+                "mode": "addurl",
+                "apikey": config["api_key"],
+                "output": "json",
+                "name": item,
+            }
+            url = f"{config['url']}/api?{urllib.parse.urlencode(params)}"
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                    if result.get("status"):
+                        print(f"Added URL: {item[:60]}...")
+                    else:
+                        print(f"Failed: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                print(f"Error adding URL: {e}")
+        else:
+            # Add via file upload
+            path = Path(item).expanduser().resolve()
+            if not path.exists():
+                print(f"File not found: {item}")
+                continue
 
-        filename = path.name
-        with open(path, 'rb') as f:
-            data = f.read()
+            filename = path.name
+            with open(path, 'rb') as f:
+                data = f.read()
 
-        boundary = '----PythonFormBoundary7MA4YWxk'
-        body = (
-            f'--{boundary}\r\n'
-            f'Content-Disposition: form-data; name="mode"\r\n\r\naddfile\r\n'
-            f'--{boundary}\r\n'
-            f'Content-Disposition: form-data; name="apikey"\r\n\r\n{config["api_key"]}\r\n'
-            f'--{boundary}\r\n'
-            f'Content-Disposition: form-data; name="nzbfile"; filename="{filename}"\r\n'
-            f'Content-Type: application/x-nzb\r\n\r\n'
-        ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
+            boundary = '----PythonFormBoundary7MA4YWxk'
+            body = (
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="mode"\r\n\r\naddfile\r\n'
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="apikey"\r\n\r\n{config["api_key"]}\r\n'
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="nzbfile"; filename="{filename}"\r\n'
+                f'Content-Type: application/x-nzb\r\n\r\n'
+            ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
 
-        req = urllib.request.Request(f"{config['url']}/api", data=body)
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+            req = urllib.request.Request(f"{config['url']}/api", data=body)
+            req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode())
-                if result.get("status"):
-                    print(f"Added: {filename}")
-                else:
-                    print(f"Failed: {filename} - {result.get('error', 'Unknown error')}")
-        except Exception as e:
-            print(f"Error adding {filename}: {e}")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                    if result.get("status"):
+                        print(f"Added: {filename}")
+                    else:
+                        print(f"Failed: {filename} - {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                print(f"Error adding {filename}: {e}")
 
 def pause(args, config):
     api_request("pause", {}, config)
@@ -193,6 +214,7 @@ Examples:
   sab queue                     # List queue items
   sab history                   # Show download history
   sab add *.nzb                 # Add NZB files to queue
+  sab add https://...           # Add NZB by URL
   sab pause                     # Pause queue
   sab resume                    # Resume queue
   sab speed                     # Show speed limit
@@ -216,8 +238,8 @@ Examples:
     hist_p.add_argument("-l", "--limit", type=int, default=20, help="Max items to show")
 
     # Add command
-    add_p = subparsers.add_parser("add", aliases=["a"], help="Add NZB files")
-    add_p.add_argument("files", nargs="+", help="NZB files to add")
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add NZB files or URLs")
+    add_p.add_argument("items", nargs="+", help="NZB files or URLs to add")
 
     # Pause command
     subparsers.add_parser("pause", aliases=["p"], help="Pause queue")

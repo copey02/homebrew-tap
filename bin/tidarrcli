@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+Tidarr CLI - Browse Tidal catalog and manage Tidarr downloads
+"""
+
+import argparse
+import json
+import sys
+import time
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "tidarr" / "config.json"
+TOKEN_CACHE_PATH = Path.home() / ".config" / "tidarr" / ".token_cache"
+TIDDL_AUTH_PATH = Path.home() / ".tiddl" / "auth.json"
+
+TIDAL_COUNTRY_CODE = "US"
+TIDAL_DEVICE_TYPE = "BROWSER"
+TIDAL_LOCALE = "en_US"
+ITEMS_PER_PAGE = 25
+
+RELEASE_TYPE_ORDER = ["ALBUM", "EP", "SINGLE", "COMPILATION"]
+
+
+def get_tidal_token():
+    """Get Tidal access token from tiddl auth.json"""
+    if TIDDL_AUTH_PATH.exists():
+        try:
+            with open(TIDDL_AUTH_PATH) as f:
+                auth = json.load(f)
+                return auth.get("token") or auth.get("access_token")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Error: Config not found at {CONFIG_PATH}")
+        print("Create it with: url, password (optional)")
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def get_cached_token():
+    if TOKEN_CACHE_PATH.exists():
+        try:
+            with open(TOKEN_CACHE_PATH) as f:
+                cache = json.load(f)
+                if cache.get("expires", 0) > time.time():
+                    return cache.get("token")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
+
+
+def save_cached_token(token, expires_in=3600):
+    TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TOKEN_CACHE_PATH, "w") as f:
+        json.dump({"token": token, "expires": time.time() + expires_in}, f)
+
+
+def authenticate(config):
+    cached = get_cached_token()
+    if cached:
+        return cached
+
+    if not config.get("password"):
+        return None
+
+    url = f"{config['url']}/api/auth"
+    body = json.dumps({"password": config["password"]}).encode()
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            token = result.get("token")
+            if token:
+                save_cached_token(token)
+                return token
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("Authentication failed: Invalid password")
+        else:
+            print(f"Auth error: {e.code} {e.reason}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Auth error: {e}")
+        sys.exit(1)
+
+    return None
+
+
+def api_request(endpoint, config, method="GET", data=None, is_proxy=False):
+    token = authenticate(config)
+
+    if is_proxy:
+        url = f"{config['url']}/proxy/tidal{endpoint}"
+    else:
+        url = f"{config['url']}/api{endpoint}"
+
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if is_proxy:
+        tidal_token = config.get("tidal_token") or get_tidal_token()
+        if tidal_token:
+            headers["Authorization"] = f"Bearer {tidal_token}"
+        else:
+            print("Error: Tidal token not found")
+            print("Either install tiddl locally and run 'tiddl auth login',")
+            print("or add 'tidal_token' to your config file.")
+            sys.exit(1)
+
+    body = None
+    if data and method in ("POST", "PUT"):
+        body = json.dumps(data).encode()
+
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode()
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                return {"_raw": content}
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            if is_proxy:
+                print("Tidal token expired. Run 'tiddl auth login' to refresh.")
+            else:
+                TOKEN_CACHE_PATH.unlink(missing_ok=True)
+                print("Session expired, please retry")
+            sys.exit(1)
+        print(f"API Error: {e.code} {e.reason}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"API Error: {e}")
+        sys.exit(1)
+
+
+def tidal_request(endpoint, config, params=None):
+    base_params = {
+        "countryCode": TIDAL_COUNTRY_CODE,
+        "deviceType": TIDAL_DEVICE_TYPE,
+        "locale": TIDAL_LOCALE,
+    }
+    if params:
+        base_params.update(params)
+
+    query = urllib.parse.urlencode(base_params)
+    full_endpoint = f"{endpoint}?{query}"
+    return api_request(full_endpoint, config, is_proxy=True)
+
+
+def format_duration(seconds):
+    try:
+        seconds = int(seconds)
+        mins = seconds // 60
+        secs = seconds % 60
+        return f"{mins}:{secs:02d}"
+    except (ValueError, TypeError):
+        return "?:??"
+
+
+def format_date(date_str):
+    if not date_str:
+        return "----"
+    return date_str[:4]
+
+
+def search(args, config):
+    query = args.query
+    search_type = args.type or "all"
+
+    params = {
+        "query": query,
+        "limit": args.limit,
+        "offset": 0,
+    }
+
+    result = tidal_request("/v1/search", config, params)
+
+    if search_type == "all":
+        types_to_show = ["artists", "albums", "tracks"]
+    else:
+        types_to_show = [search_type + "s"] if not search_type.endswith("s") else [search_type]
+
+    for content_type in types_to_show:
+        items = result.get(content_type, {}).get("items", [])
+        if not items:
+            continue
+
+        print(f"\n{content_type.upper()}")
+        print("-" * 80)
+
+        if content_type == "artists":
+            min_pop = args.min_popularity if hasattr(args, 'min_popularity') else 20
+            filtered = [a for a in items if a.get("popularity", 0) >= min_pop]
+            if not filtered and items:
+                filtered = items[:3]
+            for i, item in enumerate(filtered[:10], 1):
+                name = item.get("name", "")[:40]
+                artist_id = item.get("id", "")
+                pop = item.get("popularity", 0)
+                print(f"{i:<3} {name:<40} {'Pop:':<5}{pop:>3}  ID: {artist_id}")
+
+        elif content_type == "albums":
+            print(f"{'#':<3} {'Title':<35} {'Artist':<20} {'Year':>6} {'ID':>12}")
+            for i, item in enumerate(items[:args.limit], 1):
+                title = item.get("title", "")[:34]
+                artists = item.get("artists", [])
+                artist = artists[0].get("name", "") if artists else item.get("artist", {}).get("name", "")
+                artist = artist[:19]
+                year = format_date(item.get("releaseDate"))
+                album_id = item.get("id", "")
+                quality = ""
+                if item.get("audioQuality") == "HI_RES_LOSSLESS":
+                    quality = " [HR]"
+                print(f"{i:<3} {title:<35} {artist:<20} {year:>6} {album_id:>12}{quality}")
+
+        elif content_type == "tracks":
+            print(f"{'#':<3} {'Title':<35} {'Artist':<25} {'Dur':>6} {'ID':>12}")
+            for i, item in enumerate(items[:args.limit], 1):
+                title = item.get("title", "")[:34]
+                artists = item.get("artists", [])
+                artist = artists[0].get("name", "") if artists else item.get("artist", {}).get("name", "")
+                artist = artist[:24]
+                duration = format_duration(item.get("duration", 0))
+                track_id = item.get("id", "")
+                print(f"{i:<3} {title:<35} {artist:<25} {duration:>6} {track_id:>12}")
+
+    if not any(result.get(t, {}).get("items") for t in types_to_show):
+        print("No results found")
+
+
+def artist(args, config):
+    artist_id = args.artist_id
+
+    artist_info = tidal_request(f"/v1/artists/{artist_id}", config)
+    if not artist_info:
+        print(f"Artist not found: {artist_id}")
+        return
+
+    name = artist_info.get("name", "Unknown")
+    print(f"\n{name}")
+    print("=" * len(name))
+
+    # Fetch albums, EPs/Singles, and compilations separately
+    all_releases = []
+
+    for filter_type in [None, "EPSANDSINGLES", "COMPILATIONS"]:
+        params = {"limit": 100, "offset": 0}
+        if filter_type:
+            params["filter"] = filter_type
+        try:
+            result = tidal_request(f"/v1/artists/{artist_id}/albums", config, params)
+            all_releases.extend(result.get("items", []))
+        except Exception:
+            pass
+
+    if not all_releases:
+        print("\nNo releases found")
+        return
+
+    # Deduplicate by ID
+    seen = set()
+    items = []
+    for item in all_releases:
+        if item.get("id") not in seen:
+            seen.add(item.get("id"))
+            items.append(item)
+
+    by_type = {}
+    for item in items:
+        release_type = item.get("type", "ALBUM")
+        if release_type not in by_type:
+            by_type[release_type] = []
+        by_type[release_type].append(item)
+
+    for release_type in RELEASE_TYPE_ORDER:
+        if release_type not in by_type:
+            continue
+
+        releases = by_type[release_type]
+        releases.sort(key=lambda x: x.get("releaseDate", ""), reverse=True)
+
+        print(f"\n{release_type}S ({len(releases)})")
+        print("-" * 80)
+        print(f"{'#':<3} {'Title':<50} {'Year':>6} {'Tracks':>7}")
+
+        for i, item in enumerate(releases[:args.limit], 1):
+            title = item.get("title", "")[:49]
+            year = format_date(item.get("releaseDate"))
+            tracks = item.get("numberOfTracks", "?")
+            album_id = item.get("id", "")
+            quality = ""
+            if item.get("audioQuality") == "HI_RES_LOSSLESS":
+                quality = " [HR]"
+
+            print(f"{i:<3} {title:<50} {year:>6} {tracks:>7}{quality}")
+
+    for release_type in by_type:
+        if release_type not in RELEASE_TYPE_ORDER:
+            releases = by_type[release_type]
+            print(f"\n{release_type} ({len(releases)})")
+            print("-" * 80)
+            for i, item in enumerate(releases[:args.limit], 1):
+                title = item.get("title", "")[:49]
+                year = format_date(item.get("releaseDate"))
+                print(f"{i:<3} {title:<50} {year:>6}")
+
+    # Fetch videos
+    try:
+        videos = tidal_request(f"/v1/artists/{artist_id}/videos", config, {
+            "limit": 50,
+            "offset": 0,
+        })
+        video_items = videos.get("items", [])
+        if video_items:
+            print(f"\nVIDEOS ({len(video_items)})")
+            print("-" * 80)
+            print(f"{'#':<3} {'Title':<50} {'Year':>6} {'Dur':>6}")
+            for i, item in enumerate(video_items[:args.limit], 1):
+                title = item.get("title", "")[:49]
+                year = format_date(item.get("releaseDate"))
+                dur = format_duration(item.get("duration", 0))
+                video_id = item.get("id", "")
+                print(f"{i:<3} {title:<50} {year:>6} {dur:>6}")
+    except Exception:
+        pass
+
+
+def album(args, config):
+    album_id = args.album_id
+
+    album_info = tidal_request(f"/v1/albums/{album_id}", config)
+    if not album_info:
+        print(f"Album not found: {album_id}")
+        return
+
+    title = album_info.get("title", "Unknown")
+    artist = album_info.get("artist", {}).get("name", "Unknown")
+    year = format_date(album_info.get("releaseDate"))
+    quality = album_info.get("audioQuality", "")
+    tracks_count = album_info.get("numberOfTracks", 0)
+    duration = album_info.get("duration", 0)
+
+    print(f"\n{title}")
+    print(f"by {artist}")
+    print(f"Released: {year} | Tracks: {tracks_count} | Duration: {format_duration(duration)}")
+    if quality == "HI_RES_LOSSLESS":
+        print("Quality: Hi-Res Lossless")
+
+    tracks = tidal_request(f"/v1/albums/{album_id}/tracks", config, {"limit": 100})
+    items = tracks.get("items", [])
+
+    if items:
+        print(f"\n{'#':<4} {'Title':<55} {'Dur':>6}")
+        print("-" * 68)
+
+        for item in items:
+            num = item.get("trackNumber", "?")
+            track_title = item.get("title", "")[:54]
+            dur = format_duration(item.get("duration", 0))
+            explicit = " [E]" if item.get("explicit") else ""
+            print(f"{num:<4} {track_title:<55} {dur:>6}{explicit}")
+
+    print(f"\nTidal URL: https://listen.tidal.com/album/{album_id}")
+
+
+def add_single_item(url, item_type, config, item_id=None):
+    """Add a single item to the queue, returns (success, display_name)"""
+    if not item_id:
+        if url.startswith("http"):
+            parts = url.rstrip("/").split("/")
+            item_id = parts[-1]
+        else:
+            item_id = url
+
+    if not url.startswith("http"):
+        url_type = "artist" if item_type == "artist_videos" else item_type
+        url = f"https://listen.tidal.com/{url_type}/{item_id}"
+
+    item_data = {
+        "type": item_type,
+        "status": "queue",
+        "url": url,
+        "id": int(item_id) if item_id and str(item_id).isdigit() else item_id,
+    }
+
+    # Fetch metadata
+    if item_type == "album" and item_id:
+        try:
+            info = tidal_request(f"/v1/albums/{item_id}", config)
+            if info and not info.get("error"):
+                item_data["title"] = info.get("title", "")
+                artists = info.get("artists", [])
+                item_data["artist"] = artists[0].get("name", "") if artists else info.get("artist", {}).get("name", "")
+                item_data["quality"] = "high"
+        except Exception:
+            pass
+    elif item_type == "track" and item_id:
+        try:
+            info = tidal_request(f"/v1/tracks/{item_id}", config)
+            if info and not info.get("error"):
+                item_data["title"] = info.get("title", "")
+                artists = info.get("artists", [])
+                item_data["artist"] = artists[0].get("name", "") if artists else info.get("artist", {}).get("name", "")
+                item_data["quality"] = "high"
+        except Exception:
+            pass
+    elif item_type == "video" and item_id:
+        try:
+            info = tidal_request(f"/v1/videos/{item_id}", config)
+            if info and not info.get("error"):
+                item_data["title"] = info.get("title", "")
+                artists = info.get("artists", [])
+                item_data["artist"] = artists[0].get("name", "") if artists else info.get("artist", {}).get("name", "")
+                item_data["quality"] = "high"
+        except Exception:
+            pass
+
+    try:
+        result = api_request("/save", config, method="POST", data={"item": item_data})
+        raw = result.get("_raw", "")
+        title = item_data.get("title", url)
+        artist = item_data.get("artist", "")
+        display = f"{artist} - {title}" if artist else title
+
+        if "Created" in raw or result.get("success") or result.get("status") == "ok":
+            return True, display
+        return False, result.get("error", "Unknown error")
+    except Exception as e:
+        return False, str(e)
+
+
+def queue_add(args, config):
+    url = args.url
+    item_type = args.type or "album"
+    item_id = None
+
+    if url.startswith("http"):
+        parts = url.rstrip("/").split("/")
+        item_id = parts[-1]
+        if len(parts) >= 2 and not args.type:
+            item_type = parts[-2]
+    else:
+        item_id = url
+
+    # Handle artist_videos by fetching all videos and adding individually
+    if item_type == "artist_videos" and item_id:
+        try:
+            artist_info = tidal_request(f"/v1/artists/{item_id}", config)
+            artist_name = artist_info.get("name", "Unknown") if artist_info else "Unknown"
+
+            videos = tidal_request(f"/v1/artists/{item_id}/videos", config, {"limit": 100})
+            video_items = videos.get("items", [])
+
+            if not video_items:
+                print(f"No videos found for artist {artist_name}")
+                return
+
+            print(f"Adding {len(video_items)} videos for {artist_name}...")
+            added = 0
+            for video in video_items:
+                video_id = video.get("id")
+                success, display = add_single_item(str(video_id), "video", config, video_id)
+                if success:
+                    print(f"  Added: {display}")
+                    added += 1
+                else:
+                    print(f"  Failed: {display}")
+            print(f"Added {added}/{len(video_items)} videos")
+            return
+        except Exception as e:
+            print(f"Error fetching videos: {e}")
+            return
+
+    # Handle favorites (no URL needed)
+    if item_type.startswith("favorite_"):
+        item_data = {
+            "type": item_type,
+            "status": "queue",
+            "title": item_type.replace("_", " ").title(),
+        }
+        result = api_request("/save", config, method="POST", data={"item": item_data})
+        raw = result.get("_raw", "")
+        if "Created" in raw or result.get("success"):
+            print(f"Added to queue: {item_data['title']}")
+        else:
+            print(f"Failed to add: {result.get('error', 'Unknown error')}")
+        return
+
+    # Standard single item add
+    success, display = add_single_item(url, item_type, config, item_id)
+    if success:
+        print(f"Added to queue: {display}")
+    else:
+        print(f"Failed to add: {display}")
+
+
+def queue_list(args, config):
+    result = api_request("/queue/status", config)
+
+    paused = result.get("isPaused", result.get("paused", False))
+    status_str = "PAUSED" if paused else "RUNNING"
+    print(f"Queue Status: {status_str}")
+
+    slots = result.get("items", result.get("queue", []))
+    if not slots:
+        print("\nQueue is empty")
+        return
+
+    print(f"\n{'#':<3} {'Name':<60} {'Status':>12}")
+    print("-" * 78)
+
+    for i, item in enumerate(slots, 1):
+        name = item.get("title", item.get("name", ""))[:59]
+        item_status = item.get("status", "pending")[:11]
+        print(f"{i:<3} {name:<60} {item_status:>12}")
+
+
+def queue_pause(args, config):
+    api_request("/queue/pause", config, method="POST")
+    print("Queue paused")
+
+
+def queue_resume(args, config):
+    api_request("/queue/resume", config, method="POST")
+    print("Queue resumed")
+
+
+def queue_remove(args, config):
+    item_id = args.id
+    if item_id == "all":
+        api_request("/remove-all", config, method="DELETE")
+        print("Cleared all queue items")
+    elif item_id == "finished":
+        api_request("/remove-finished", config, method="DELETE")
+        print("Removed finished items")
+    else:
+        api_request(f"/remove?id={item_id}", config, method="DELETE")
+        print(f"Removed item: {item_id}")
+
+
+def history_cmd(args, config):
+    result = api_request("/history/list", config)
+    items = result.get("items", result) if isinstance(result, dict) else result
+
+    if not items:
+        print("History is empty")
+        return
+
+    print(f"\n{'Name':<60} {'Date':>12}")
+    print("-" * 75)
+
+    display_items = items[:args.limit] if isinstance(items, list) else []
+    for item in display_items:
+        name = item.get("title", item.get("name", ""))[:59]
+        date = item.get("downloadedAt", item.get("date", ""))[:10]
+        print(f"{name:<60} {date:>12}")
+
+
+def status(args, config):
+    try:
+        result = api_request("/queue/status", config)
+        paused = result.get("isPaused", result.get("paused", False))
+
+        items = result.get("items", result.get("queue", []))
+        total = len(items)
+        downloading = sum(1 for i in items if i.get("status") == "downloading")
+        pending = sum(1 for i in items if i.get("status") == "pending")
+        completed = sum(1 for i in items if i.get("status") == "completed")
+
+        status_str = "PAUSED" if paused else "RUNNING"
+        print(f"Status:      {status_str}")
+        print(f"Total:       {total}")
+        print(f"Downloading: {downloading}")
+        print(f"Pending:     {pending}")
+        print(f"Completed:   {completed}")
+    except Exception as e:
+        print(f"Could not get status: {e}")
+
+
+def watch(args, config):
+    print("Watching queue... (Ctrl+C to stop)")
+    try:
+        while True:
+            result = api_request("/queue/status", config)
+            items = result.get("items", result.get("queue", []))
+            active = sum(1 for i in items if i.get("status") in ("downloading", "pending"))
+            completed = sum(1 for i in items if i.get("status") == "completed")
+            paused = result.get("isPaused", result.get("paused", False))
+
+            status_str = "PAUSED" if paused else "RUNNING"
+            print(f"\r[{status_str}] Active: {active} | Completed: {completed}    ", end="", flush=True)
+
+            if active == 0 and not paused:
+                print("\nQueue complete!")
+                break
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped watching")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tidarr CLI - Browse Tidal and manage Tidarr downloads",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  td search "Artist Name"              # Search all (artists, albums, tracks)
+  td search "Album Name" -t album      # Search albums only
+  td artist 12345                      # View artist releases by type
+  td album 67890                       # View album with tracks
+  td add 12345                         # Add album ID to queue
+  td add "https://tidal.com/..."       # Add Tidal URL to queue
+  td queue                             # List queue items
+  td pause / resume                    # Control queue
+  td history                           # View download history
+  td watch                             # Monitor queue until complete
+
+Config file: ~/.config/tidarr/config.json
+{
+  "url": "http://localhost:8484",
+  "password": "your-password"  // optional, if Tidarr auth enabled
+}
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Search command
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search Tidal catalog")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("-t", "--type", choices=["artist", "album", "track"], help="Search type")
+    search_p.add_argument("-l", "--limit", type=int, default=15, help="Max results (default: 15)")
+    search_p.add_argument("-p", "--min-popularity", type=int, default=20, dest="min_popularity",
+                          help="Min artist popularity to show (default: 20, use 0 for all)")
+
+    # Artist command
+    artist_p = subparsers.add_parser("artist", aliases=["ar"], help="View artist releases")
+    artist_p.add_argument("artist_id", help="Tidal artist ID")
+    artist_p.add_argument("-l", "--limit", type=int, default=25, help="Max per category (default: 25)")
+
+    # Album command
+    album_p = subparsers.add_parser("album", aliases=["al"], help="View album with tracks")
+    album_p.add_argument("album_id", help="Tidal album ID")
+
+    # Add to queue command
+    add_p = subparsers.add_parser("add", aliases=["a"], help="Add to download queue")
+    add_p.add_argument("url", help="Tidal URL or ID")
+    add_p.add_argument("-t", "--type",
+                       choices=["album", "track", "video", "playlist", "mix",
+                                "artist", "artist_videos",
+                                "favorite_albums", "favorite_tracks", "favorite_playlists",
+                                "favorite_videos", "favorite_artists"],
+                       default="album", help="Content type (default: album)")
+
+    # Queue command
+    queue_p = subparsers.add_parser("queue", aliases=["q"], help="List queue items")
+
+    # Pause command
+    subparsers.add_parser("pause", aliases=["p"], help="Pause queue")
+
+    # Resume command
+    subparsers.add_parser("resume", aliases=["r"], help="Resume queue")
+
+    # Remove command
+    remove_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove from queue")
+    remove_p.add_argument("id", help="Item ID, 'all', or 'finished'")
+
+    # History command
+    hist_p = subparsers.add_parser("history", aliases=["h"], help="View download history")
+    hist_p.add_argument("-l", "--limit", type=int, default=20, help="Max items (default: 20)")
+
+    # Status command
+    subparsers.add_parser("status", aliases=["st"], help="Queue status summary")
+
+    # Watch command
+    watch_p = subparsers.add_parser("watch", aliases=["w"], help="Watch queue until complete")
+    watch_p.add_argument("-i", "--interval", type=int, default=5, help="Update interval in seconds")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    config = load_config()
+
+    cmd_map = {
+        "search": search, "s": search,
+        "artist": artist, "ar": artist,
+        "album": album, "al": album,
+        "add": queue_add, "a": queue_add,
+        "queue": queue_list, "q": queue_list,
+        "pause": queue_pause, "p": queue_pause,
+        "resume": queue_resume, "r": queue_resume,
+        "remove": queue_remove, "rm": queue_remove,
+        "history": history_cmd, "h": history_cmd,
+        "status": status, "st": status,
+        "watch": watch, "w": watch,
+    }
+
+    if args.command in cmd_map:
+        cmd_map[args.command](args, config)
+
+
+if __name__ == "__main__":
+    main()

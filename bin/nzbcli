@@ -12,6 +12,7 @@ import urllib.parse
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "nzbgeek" / "config.json"
+SAB_CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
 
 # NZBgeek categories
 CATEGORIES = {
@@ -47,6 +48,32 @@ def format_size(bytes_val):
     gb = int(bytes_val) / 1024 / 1024 / 1024
     return f"{gb:.1f} GB"
 
+def load_sab_config():
+    if not SAB_CONFIG_PATH.exists():
+        return None
+    with open(SAB_CONFIG_PATH) as f:
+        return json.load(f)
+
+def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
+    """Add NZB to SABnzbd via URL"""
+    params = {
+        "mode": "addurl",
+        "apikey": sab_config["api_key"],
+        "output": "json",
+        "name": nzb_url,
+    }
+    if nzb_name:
+        params["nzbname"] = nzb_name
+
+    url = f"{sab_config['url']}/api?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            return result.get("status", False)
+    except Exception as e:
+        print(f"SABnzbd error: {e}")
+        return False
+
 def search(args, config):
     query = args.query
 
@@ -81,15 +108,26 @@ def search(args, config):
         print("No results found")
         return
 
+    # Load SAB config if adding to SABnzbd
+    sab_config = None
+    if args.add_to_sab:
+        sab_config = load_sab_config()
+        if not sab_config:
+            print("Error: SABnzbd config not found at ~/.config/sabnzbd/config.json")
+            sys.exit(1)
+
     # Pagination info
     start = offset + 1
     end = offset + len(items)
 
-    print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
-    print("-" * 105)
+    added_count = 0
+
+    if not args.add_to_sab:
+        print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
+        print("-" * 105)
 
     for item in items:
-        title = item.get("title", "")[:79]
+        title = item.get("title", "")
         size = format_size(item.get("enclosure", {}).get("@attributes", {}).get("length", 0))
         date = item.get("pubDate", "")[:12]
 
@@ -101,56 +139,105 @@ def search(args, config):
                 guid = attr.get("@attributes", {}).get("value", "")
                 break
 
-        print(f"{title:<80} {size:>10} {date:<12}")
-        if args.show_guid:
-            print(f"  GUID: {guid}")
+        if args.add_to_sab and guid:
+            # Build NZB download URL and add to SABnzbd
+            nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+            if add_to_sabnzbd(nzb_url, sab_config, title):
+                print(f"Added: {title[:70]}")
+                added_count += 1
+            else:
+                print(f"Failed: {title[:70]}")
+        else:
+            print(f"{title[:79]:<80} {size:>10} {date:<12}")
+            if args.show_guid:
+                print(f"  GUID: {guid}")
 
-    print(f"\nShowing {start}-{end} of {total} results")
-    if end < total:
-        next_offset = offset + args.limit
-        print(f"Next page: nzb search \"{args.query}\" --offset {next_offset}")
+    if args.add_to_sab:
+        print(f"\nAdded {added_count}/{len(items)} NZBs to SABnzbd")
+    else:
+        print(f"\nShowing {start}-{end} of {total} results")
+        if end < total:
+            next_offset = offset + args.limit
+            print(f"Next page: nzb search \"{args.query}\" --offset {next_offset}")
 
 def get(args, config):
     import re
     import tempfile
-
-    guid = args.guid
-    output_dir = Path(args.output or config.get("default_download_path", "."))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Download NZB to temp file first
-    url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
-
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".nzb") as tmp:
-            tmp_path = tmp.name
-        urllib.request.urlretrieve(url, tmp_path)
-    except Exception as e:
-        print(f"Download error: {e}")
-        sys.exit(1)
-
-    # Extract title from NZB meta name
-    title = guid
-    try:
-        with open(tmp_path, 'r', encoding='utf-8') as f:
-            content = f.read(4096)  # Read first 4KB for meta tags
-            match = re.search(r'<meta type="name">([^<]+)</meta>', content)
-            if match:
-                title = match.group(1)
-    except Exception:
-        pass
-
-    filename = f"{title}.nzb"
-    output_path = output_dir / filename
-
-    # Move temp file to final location
     import shutil
-    shutil.move(tmp_path, output_path)
 
-    size = output_path.stat().st_size / 1024
-    print(f"Downloaded: {filename}")
-    print(f"Size: {size:.1f} KB")
-    print(f"Path: {output_path}")
+    guids = args.guids
+
+    # If adding to SAB, load config
+    sab_config = None
+    if args.add_to_sab:
+        sab_config = load_sab_config()
+        if not sab_config:
+            print("Error: SABnzbd config not found at ~/.config/sabnzbd/config.json")
+            sys.exit(1)
+
+    output_dir = Path(args.output or config.get("default_download_path", "."))
+    if not args.add_to_sab:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    success_count = 0
+    for guid in guids:
+        url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+
+        if args.add_to_sab:
+            # Direct to SABnzbd - get title first
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".nzb") as tmp:
+                    tmp_path = tmp.name
+                urllib.request.urlretrieve(url, tmp_path)
+                title = guid
+                with open(tmp_path, 'r', encoding='utf-8') as f:
+                    content = f.read(4096)
+                    match = re.search(r'<meta type="name">([^<]+)</meta>', content)
+                    if match:
+                        title = match.group(1)
+                os.unlink(tmp_path)
+
+                if add_to_sabnzbd(url, sab_config, title):
+                    print(f"Added: {title[:70]}")
+                    success_count += 1
+                else:
+                    print(f"Failed: {title[:70]}")
+            except Exception as e:
+                print(f"Error with {guid}: {e}")
+        else:
+            # Download to file
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".nzb") as tmp:
+                    tmp_path = tmp.name
+                urllib.request.urlretrieve(url, tmp_path)
+            except Exception as e:
+                print(f"Download error for {guid}: {e}")
+                continue
+
+            # Extract title from NZB meta name
+            title = guid
+            try:
+                with open(tmp_path, 'r', encoding='utf-8') as f:
+                    content = f.read(4096)
+                    match = re.search(r'<meta type="name">([^<]+)</meta>', content)
+                    if match:
+                        title = match.group(1)
+            except Exception:
+                pass
+
+            filename = f"{title}.nzb"
+            output_path = output_dir / filename
+            shutil.move(tmp_path, output_path)
+
+            size = output_path.stat().st_size / 1024
+            print(f"Downloaded: {filename} ({size:.1f} KB)")
+            success_count += 1
+
+    if len(guids) > 1:
+        if args.add_to_sab:
+            print(f"\nAdded {success_count}/{len(guids)} NZBs to SABnzbd")
+        else:
+            print(f"\nDownloaded {success_count}/{len(guids)} NZBs to {output_dir}")
 
 def recent(args, config):
     query = args.group or ""
@@ -183,14 +270,25 @@ def recent(args, config):
         print("No results found")
         return
 
+    # Load SAB config if adding to SABnzbd
+    sab_config = None
+    if args.add_to_sab:
+        sab_config = load_sab_config()
+        if not sab_config:
+            print("Error: SABnzbd config not found at ~/.config/sabnzbd/config.json")
+            sys.exit(1)
+
     # Pagination info
     start = offset + 1
     end = offset + len(items)
 
+    added_count = 0
+
     # Group by show/movie name
     seen = set()
-    print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
-    print("-" * 100)
+    if not args.add_to_sab:
+        print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
+        print("-" * 100)
 
     for item in items:
         title = item.get("title", "")
@@ -214,16 +312,27 @@ def recent(args, config):
                 guid = attr.get("@attributes", {}).get("value", "")
                 break
 
-        print(f"{title[:74]:<75} {size:>10} {date:<12}")
-        if args.show_guid:
-            print(f"  GUID: {guid}")
+        if args.add_to_sab and guid:
+            nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+            if add_to_sabnzbd(nzb_url, sab_config, title):
+                print(f"Added: {title[:70]}")
+                added_count += 1
+            else:
+                print(f"Failed: {title[:70]}")
+        else:
+            print(f"{title[:74]:<75} {size:>10} {date:<12}")
+            if args.show_guid:
+                print(f"  GUID: {guid}")
 
-    print(f"\nShowing {start}-{end} of {total} results")
-    if end < total:
-        next_offset = offset + args.limit
-        group_arg = f"-g {args.group} " if args.group else ""
-        cat_arg = f"-c {args.cat} " if args.cat else ""
-        print(f"Next page: nzb recent {group_arg}{cat_arg}--offset {next_offset}")
+    if args.add_to_sab:
+        print(f"\nAdded {added_count} NZBs to SABnzbd")
+    else:
+        print(f"\nShowing {start}-{end} of {total} results")
+        if end < total:
+            next_offset = offset + args.limit
+            group_arg = f"-g {args.group} " if args.group else ""
+            cat_arg = f"-c {args.cat} " if args.cat else ""
+            print(f"Next page: nzb recent {group_arg}{cat_arg}--offset {next_offset}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -235,13 +344,17 @@ Examples:
   nzb search "Slow Horses S04" -c tv        # Search TV
   nzb search "Dogma" --no-default-res       # Search without 1080p filter
   nzb search "Dogma" --offset 50            # Page 2 of results
+  nzb search "Friends S07 Silence" -S       # Search and add ALL to SABnzbd
   nzb get <guid>                            # Download NZB by GUID
+  nzb get <guid1> <guid2> <guid3>           # Download multiple NZBs
   nzb get <guid> -o ~/Downloads             # Download to specific folder
+  nzb get <guid1> <guid2> -S                # Add multiple directly to SABnzbd
   nzb recent -g FraMeSToR -c movies         # Recent FraMeSToR movies
   nzb recent -g HONE -c tv                  # Recent HONE TV releases
 
 Categories: movies, movies-hd, tv, tv-hd (or numeric IDs)
 Default: 50 results per page, use --offset to paginate
+Use -S/--add-to-sab to send NZBs directly to SABnzbd
         """
     )
 
@@ -255,11 +368,13 @@ Default: 50 results per page, use --offset to paginate
     search_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     search_p.add_argument("--no-default-res", action="store_true", help="Don't add default resolution to search")
     search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs for downloading")
+    search_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
 
     # Get/download command
-    get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download NZB by GUID")
-    get_p.add_argument("guid", help="NZB GUID to download")
+    get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download NZB by GUID(s)")
+    get_p.add_argument("guids", nargs="+", help="NZB GUID(s) to download")
     get_p.add_argument("-o", "--output", help="Output directory")
+    get_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add directly to SABnzbd instead of downloading")
 
     # Recent command
     recent_p = subparsers.add_parser("recent", aliases=["r"], help="Recent releases")
@@ -269,6 +384,7 @@ Default: 50 results per page, use --offset to paginate
     recent_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
     recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs")
+    recent_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
 
     args = parser.parse_args()
 
