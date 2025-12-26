@@ -15,6 +15,18 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "sonarr" / "config.json"
 
+# Cache for series lookup
+_series_cache = {}
+
+
+def get_series_lookup(instance):
+    """Get series id -> title lookup dict, cached per instance."""
+    cache_key = instance["url"]
+    if cache_key not in _series_cache:
+        series_list = api_request(instance, "series")
+        _series_cache[cache_key] = {s["id"]: s["title"] for s in series_list}
+    return _series_cache[cache_key]
+
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -496,7 +508,7 @@ def cmd_queue(args, config):
     """Show download queue."""
     instance = get_instance(config, args.instance)
 
-    params = {"page": 1, "pageSize": args.limit}
+    params = {"page": 1, "pageSize": args.limit, "includeSeries": "true", "includeEpisode": "true"}
     result = api_request(instance, "queue", params=params)
 
     records = result.get("records", [])
@@ -509,12 +521,16 @@ def cmd_queue(args, config):
         print(json.dumps(result, indent=2))
         return
 
+    # Get series lookup for titles
+    series_lookup = get_series_lookup(instance)
+
     print(f"\n{'ID':<6} {'Series':<30} {'Episode':<12} {'Quality':<12} {'Status':<15} {'Progress':>8}")
     print("-" * 90)
 
     for item in records:
         q_id = item.get("id", "")
-        series = truncate(item.get("series", {}).get("title", "Unknown"), 29)
+        series_title = item.get("series", {}).get("title") or series_lookup.get(item.get("seriesId"), "Unknown")
+        series = truncate(series_title, 29)
         episode = item.get("episode", {})
         ep_str = f"S{episode.get('seasonNumber', 0):02d}E{episode.get('episodeNumber', 0):02d}"
         quality = item.get("quality", {}).get("quality", {}).get("name", "?")
@@ -589,6 +605,7 @@ def cmd_calendar(args, config):
         "start": start.strftime("%Y-%m-%d"),
         "end": end.strftime("%Y-%m-%d"),
         "unmonitored": "true" if args.unmonitored else "false",
+        "includeSeries": "true",
     }
 
     episodes = api_request(instance, "calendar", params=params)
@@ -603,6 +620,9 @@ def cmd_calendar(args, config):
 
     # Sort by air date
     episodes.sort(key=lambda x: x.get("airDateUtc", ""))
+
+    # Get series lookup for titles
+    series_lookup = get_series_lookup(instance)
 
     print(f"\n{'Date':<12} {'Time':<6} {'Series':<35} {'Episode':<10} {'Title':<25}")
     print("-" * 95)
@@ -628,7 +648,8 @@ def cmd_calendar(args, config):
                 print()
             current_date = date_str
 
-        series = truncate(ep.get("series", {}).get("title", "Unknown"), 34)
+        series_title = ep.get("series", {}).get("title") or series_lookup.get(ep.get("seriesId"), "Unknown")
+        series = truncate(series_title, 34)
         ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
         title = truncate(ep.get("title", "TBA"), 24)
         has_file = "✓" if ep.get("hasFile") else ""
@@ -645,6 +666,7 @@ def cmd_wanted(args, config):
         "pageSize": args.limit,
         "sortKey": "airDateUtc",
         "sortDirection": "descending",
+        "includeSeries": "true",
     }
 
     result = api_request(instance, "wanted/missing", params=params)
@@ -658,12 +680,16 @@ def cmd_wanted(args, config):
         print(json.dumps(result, indent=2))
         return
 
+    # Get series lookup for titles
+    series_lookup = get_series_lookup(instance)
+
     print(f"\n{'ID':<8} {'Series':<35} {'Episode':<10} {'Title':<30} {'Air Date':<12}")
     print("-" * 100)
 
     for ep in records:
         ep_id = ep.get("id", "")
-        series = truncate(ep.get("series", {}).get("title", "Unknown"), 34)
+        series_title = ep.get("series", {}).get("title") or series_lookup.get(ep.get("seriesId"), "Unknown")
+        series = truncate(series_title, 34)
         ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
         title = truncate(ep.get("title", "TBA"), 29)
         air_date = format_short_date(ep.get("airDateUtc"))
@@ -681,6 +707,7 @@ def cmd_cutoff(args, config):
     params = {
         "page": args.page,
         "pageSize": args.limit,
+        "includeSeries": "true",
     }
 
     result = api_request(instance, "wanted/cutoff", params=params)
@@ -694,12 +721,16 @@ def cmd_cutoff(args, config):
         print(json.dumps(result, indent=2))
         return
 
+    # Get series lookup for titles
+    series_lookup = get_series_lookup(instance)
+
     print(f"\n{'ID':<8} {'Series':<30} {'Episode':<10} {'Current':<15} {'Cutoff':<15}")
     print("-" * 85)
 
     for ep in records:
         ep_id = ep.get("id", "")
-        series = truncate(ep.get("series", {}).get("title", "Unknown"), 29)
+        series_title = ep.get("series", {}).get("title") or series_lookup.get(ep.get("seriesId"), "Unknown")
+        series = truncate(series_title, 29)
         ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
 
         current = "Unknown"
@@ -727,6 +758,8 @@ def cmd_history(args, config):
         "pageSize": args.limit,
         "sortKey": "date",
         "sortDirection": "descending",
+        "includeSeries": "true",
+        "includeEpisode": "true",
     }
 
     if args.series_id:
@@ -743,13 +776,17 @@ def cmd_history(args, config):
         print(json.dumps(result, indent=2))
         return
 
+    # Get series lookup for titles
+    series_lookup = get_series_lookup(instance)
+
     print(f"\n{'Date':<18} {'Event':<15} {'Series':<30} {'Episode':<10} {'Quality':<12}")
     print("-" * 90)
 
     for h in records:
         date = format_date(h.get("date"))
         event = h.get("eventType", "unknown")
-        series = truncate(h.get("series", {}).get("title", "Unknown"), 29)
+        series_title = h.get("series", {}).get("title") or series_lookup.get(h.get("seriesId"), "Unknown")
+        series = truncate(series_title, 29)
         ep = h.get("episode", {})
         ep_str = f"S{ep.get('seasonNumber', 0):02d}E{ep.get('episodeNumber', 0):02d}"
         quality = h.get("quality", {}).get("quality", {}).get("name", "?")
