@@ -2,8 +2,8 @@ class Sonarrcli < Formula
   desc "Sonarr CLI - Manage TV series and downloads via Sonarr API"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/sonarrcli"
-  version "1.0.1"
-  sha256 "3987d3a8a5f6f4f476ba04dd296c4545e91c1ee245668b58d1a27d0f33575857"
+  version "1.0.2"
+  sha256 "70dde6511b2ebc46c45cb9e1f142eebbaace150d9244e96c2f107294656669e4"
   license "MIT"
 
   depends_on "python@3"
@@ -40,6 +40,9 @@ class Sonarrcli < Formula
         snr queue                   Show download queue
         snr calendar                Upcoming episodes
         snr wanted                  Missing episodes
+        snr profiles                List quality profiles
+        snr cf                      List custom formats
+        snr profile-scores 22       View profile CF scores
         snr -I 4k series            Use a different instance
     EOS
   end

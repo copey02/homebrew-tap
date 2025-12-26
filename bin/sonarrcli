@@ -918,6 +918,298 @@ def cmd_profile(args, config):
 
 
 # =============================================================================
+# CUSTOM FORMATS
+# =============================================================================
+
+def cmd_customformats(args, config):
+    """List all custom formats."""
+    instance = get_instance(config, args.instance)
+
+    formats = api_request(instance, "customformat")
+
+    if not formats:
+        print("No custom formats found")
+        return
+
+    if args.json:
+        print(json.dumps(formats, indent=2))
+        return
+
+    print(f"\n{'ID':<5} {'Name':<40} {'Specs':<6}")
+    print("-" * 55)
+
+    for cf in sorted(formats, key=lambda x: x.get("name", "").lower()):
+        cf_id = cf.get("id", "")
+        name = truncate(cf.get("name", ""), 39)
+        specs = len(cf.get("specifications", []))
+
+        print(f"{cf_id:<5} {name:<40} {specs:<6}")
+
+    print(f"\nTotal: {len(formats)} custom formats")
+
+
+def cmd_customformat(args, config):
+    """View custom format details."""
+    instance = get_instance(config, args.instance)
+
+    cf = api_request(instance, f"customformat/{args.format_id}")
+
+    if args.json:
+        print(json.dumps(cf, indent=2))
+        return
+
+    print(f"\n{cf.get('name', 'Unknown')} (ID: {cf.get('id')})")
+    print("=" * 60)
+
+    specs = cf.get("specifications", [])
+    if specs:
+        print("\nSpecifications:")
+        for spec in specs:
+            name = spec.get("name", "Unknown")
+            impl = spec.get("implementation", "")
+            negate = " (NEGATE)" if spec.get("negate") else ""
+            required = " (REQUIRED)" if spec.get("required") else ""
+
+            print(f"  {name}: {impl}{negate}{required}")
+
+            for field in spec.get("fields", []):
+                if field.get("value"):
+                    print(f"    {field.get('name', 'value')}: {field.get('value')}")
+    else:
+        print("\nNo specifications defined")
+
+
+def cmd_customformat_create(args, config):
+    """Create a new custom format."""
+    instance = get_instance(config, args.instance)
+
+    # Build specifications based on args
+    specs = []
+
+    if args.release_group:
+        specs.append({
+            "name": "Release Group",
+            "implementation": "ReleaseGroupSpecification",
+            "negate": False,
+            "required": True,
+            "fields": [{"name": "value", "value": args.release_group}]
+        })
+
+    if args.release_title:
+        specs.append({
+            "name": "Release Title",
+            "implementation": "ReleaseTitleSpecification",
+            "negate": args.negate_title or False,
+            "required": True,
+            "fields": [{"name": "value", "value": args.release_title}]
+        })
+
+    if args.source:
+        source_map = {
+            "bluray": 6, "webdl": 3, "webrip": 4, "hdtv": 1,
+            "dvd": 5, "bluray-raw": 7, "webdl-raw": 8
+        }
+        source_val = source_map.get(args.source.lower(), 6)
+        specs.append({
+            "name": "Source",
+            "implementation": "SourceSpecification",
+            "negate": False,
+            "required": True,
+            "fields": [{"name": "value", "value": source_val}]
+        })
+
+    if args.resolution:
+        res_map = {"480": 480, "720": 720, "1080": 1080, "2160": 2160}
+        res_val = res_map.get(args.resolution.replace("p", ""), 1080)
+        specs.append({
+            "name": "Resolution",
+            "implementation": "ResolutionSpecification",
+            "negate": False,
+            "required": True,
+            "fields": [{"name": "value", "value": res_val}]
+        })
+
+    if not specs:
+        print("Error: At least one specification required")
+        print("Use --release-group, --release-title, --source, or --resolution")
+        sys.exit(1)
+
+    data = {
+        "name": args.name,
+        "includeCustomFormatWhenRenaming": False,
+        "specifications": specs
+    }
+
+    result = api_request(instance, "customformat", method="POST", data=data)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Created custom format: {result.get('name')} (ID: {result.get('id')})")
+
+
+def cmd_customformat_delete(args, config):
+    """Delete a custom format."""
+    instance = get_instance(config, args.instance)
+
+    # Get format info first
+    cf = api_request(instance, f"customformat/{args.format_id}")
+
+    if not args.yes:
+        response = input(f"Delete custom format '{cf.get('name')}'? (yes/no): ")
+        if response.lower() != "yes":
+            print("Cancelled")
+            return
+
+    api_request(instance, f"customformat/{args.format_id}", method="DELETE")
+    print(f"Deleted: {cf.get('name')}")
+
+
+# =============================================================================
+# PROFILE MANAGEMENT
+# =============================================================================
+
+def cmd_profile_duplicate(args, config):
+    """Duplicate a quality profile."""
+    instance = get_instance(config, args.instance)
+
+    # Get the source profile
+    source = api_request(instance, f"qualityprofile/{args.profile_id}")
+
+    # Remove id and modify name
+    new_profile = {k: v for k, v in source.items() if k != "id"}
+    new_profile["name"] = args.name or f"{source.get('name', 'Profile')} (Copy)"
+
+    result = api_request(instance, "qualityprofile", method="POST", data=new_profile)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Created profile: {result.get('name')} (ID: {result.get('id')})")
+        print(f"  Copied from: {source.get('name')} (ID: {source.get('id')})")
+
+
+def cmd_profile_score(args, config):
+    """Set custom format score on a profile."""
+    instance = get_instance(config, args.instance)
+
+    # Get the profile
+    profile = api_request(instance, f"qualityprofile/{args.profile_id}")
+
+    # Find and update the custom format score
+    format_items = profile.get("formatItems", [])
+    found = False
+
+    for item in format_items:
+        if item.get("format") == args.format_id:
+            old_score = item.get("score", 0)
+            item["score"] = args.score
+            found = True
+            break
+
+    if not found:
+        # Add new format item
+        format_items.append({
+            "format": args.format_id,
+            "name": f"Format {args.format_id}",
+            "score": args.score
+        })
+
+    profile["formatItems"] = format_items
+
+    result = api_request(instance, f"qualityprofile/{args.profile_id}", method="PUT", data=profile)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        cf_name = next((f.get("name", f"ID {args.format_id}") for f in format_items if f.get("format") == args.format_id), f"ID {args.format_id}")
+        if found:
+            print(f"Updated {cf_name}: {old_score} → {args.score}")
+        else:
+            print(f"Added {cf_name}: {args.score}")
+
+
+def cmd_profile_scores(args, config):
+    """Show custom format scores for a profile."""
+    instance = get_instance(config, args.instance)
+
+    profile = api_request(instance, f"qualityprofile/{args.profile_id}")
+
+    if args.json:
+        print(json.dumps(profile.get("formatItems", []), indent=2))
+        return
+
+    print(f"\nCustom Format Scores for: {profile.get('name')}")
+    print("=" * 60)
+
+    format_items = profile.get("formatItems", [])
+    # Sort by score descending
+    format_items = sorted(format_items, key=lambda x: x.get("score", 0), reverse=True)
+
+    # Filter by non-zero if requested
+    if args.nonzero:
+        format_items = [f for f in format_items if f.get("score", 0) != 0]
+
+    print(f"\n{'ID':<5} {'Score':>10} {'Name':<40}")
+    print("-" * 60)
+
+    for item in format_items:
+        f_id = item.get("format", "")
+        score = item.get("score", 0)
+        name = truncate(item.get("name", "Unknown"), 39)
+
+        print(f"{f_id:<5} {score:>10} {name:<40}")
+
+    print(f"\nTotal: {len(format_items)} format scores")
+
+
+# =============================================================================
+# ROOT FOLDERS & TAGS
+# =============================================================================
+
+def cmd_rootfolders(args, config):
+    """List root folders."""
+    instance = get_instance(config, args.instance)
+
+    folders = api_request(instance, "rootfolder")
+
+    if args.json:
+        print(json.dumps(folders, indent=2))
+        return
+
+    print(f"\n{'ID':<5} {'Path':<50} {'Free Space':>12}")
+    print("-" * 70)
+
+    for rf in folders:
+        rf_id = rf.get("id", "")
+        path = truncate(rf.get("path", ""), 49)
+        free = format_size(rf.get("freeSpace", 0))
+
+        print(f"{rf_id:<5} {path:<50} {free:>12}")
+
+
+def cmd_tags(args, config):
+    """List tags."""
+    instance = get_instance(config, args.instance)
+
+    tags = api_request(instance, "tag")
+
+    if args.json:
+        print(json.dumps(tags, indent=2))
+        return
+
+    if not tags:
+        print("No tags found")
+        return
+
+    print(f"\n{'ID':<5} {'Label':<30}")
+    print("-" * 40)
+
+    for tag in sorted(tags, key=lambda x: x.get("label", "").lower()):
+        print(f"{tag.get('id', ''):<5} {tag.get('label', ''):<30}")
+
+
+# =============================================================================
 # SYSTEM COMMANDS
 # =============================================================================
 
@@ -1106,6 +1398,42 @@ Config file: ~/.config/sonarr/config.json
     profile_p = subparsers.add_parser("profile", help="View quality profile")
     profile_p.add_argument("profile_id", type=int, help="Profile ID")
 
+    profile_dup_p = subparsers.add_parser("profile-duplicate", aliases=["pd"], help="Duplicate a profile")
+    profile_dup_p.add_argument("profile_id", type=int, help="Source profile ID")
+    profile_dup_p.add_argument("-n", "--name", help="Name for new profile")
+
+    profile_score_p = subparsers.add_parser("profile-score", aliases=["ps"], help="Set custom format score")
+    profile_score_p.add_argument("profile_id", type=int, help="Profile ID")
+    profile_score_p.add_argument("format_id", type=int, help="Custom format ID")
+    profile_score_p.add_argument("score", type=int, help="Score value")
+
+    profile_scores_p = subparsers.add_parser("profile-scores", help="View custom format scores")
+    profile_scores_p.add_argument("profile_id", type=int, help="Profile ID")
+    profile_scores_p.add_argument("--nonzero", action="store_true", help="Show only non-zero scores")
+
+    # --- Custom Formats ---
+    customformats_p = subparsers.add_parser("customformats", aliases=["cf"], help="List custom formats")
+
+    customformat_p = subparsers.add_parser("customformat", help="View custom format details")
+    customformat_p.add_argument("format_id", type=int, help="Custom format ID")
+
+    customformat_create_p = subparsers.add_parser("customformat-create", aliases=["cfc"], help="Create custom format")
+    customformat_create_p.add_argument("name", help="Custom format name")
+    customformat_create_p.add_argument("--release-group", help="Release group regex pattern")
+    customformat_create_p.add_argument("--release-title", help="Release title regex pattern")
+    customformat_create_p.add_argument("--negate-title", action="store_true", help="Negate release title match")
+    customformat_create_p.add_argument("--source", choices=["bluray", "webdl", "webrip", "hdtv", "dvd"], help="Source type")
+    customformat_create_p.add_argument("--resolution", choices=["480p", "720p", "1080p", "2160p"], help="Resolution")
+
+    customformat_delete_p = subparsers.add_parser("customformat-delete", aliases=["cfd"], help="Delete custom format")
+    customformat_delete_p.add_argument("format_id", type=int, help="Custom format ID")
+    customformat_delete_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+    # --- Root Folders & Tags ---
+    rootfolders_p = subparsers.add_parser("rootfolders", aliases=["rf"], help="List root folders")
+
+    tags_p = subparsers.add_parser("tags", aliases=["t"], help="List tags")
+
     # --- System ---
     refresh_p = subparsers.add_parser("refresh", aliases=["r"], help="Refresh series")
     refresh_p.add_argument("series_id", type=int, nargs="?", help="Series ID (optional, refreshes all if omitted)")
@@ -1143,6 +1471,15 @@ Config file: ~/.config/sonarr/config.json
         "import": cmd_import, "im": cmd_import,
         "profiles": cmd_profiles, "qp": cmd_profiles,
         "profile": cmd_profile,
+        "profile-duplicate": cmd_profile_duplicate, "pd": cmd_profile_duplicate,
+        "profile-score": cmd_profile_score, "ps": cmd_profile_score,
+        "profile-scores": cmd_profile_scores,
+        "customformats": cmd_customformats, "cf": cmd_customformats,
+        "customformat": cmd_customformat,
+        "customformat-create": cmd_customformat_create, "cfc": cmd_customformat_create,
+        "customformat-delete": cmd_customformat_delete, "cfd": cmd_customformat_delete,
+        "rootfolders": cmd_rootfolders, "rf": cmd_rootfolders,
+        "tags": cmd_tags, "t": cmd_tags,
         "refresh": cmd_refresh, "r": cmd_refresh,
         "commands": cmd_commands,
     }
