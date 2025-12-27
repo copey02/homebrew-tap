@@ -2,8 +2,8 @@ class Tkcli < Formula
   desc "Tracker CLI - Search private trackers (BHD, UNIT3D, FileList, TorrentLeech)"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/tkcli"
-  version "1.2.0"
-  sha256 "897830dd037d2fa00e23e86501a6d8698aafdc29ccef43848ca38bc7306a8e1a"
+  version "1.3.0"
+  sha256 "b3361379a3fcce086a081beea9037803d20a50f6d3646e61a956b8c4a98a6b2b"
   license "MIT"
 
   depends_on "python@3"
@@ -15,11 +15,11 @@ class Tkcli < Formula
   def caveats
     <<~EOS
       Supported trackers:
-        bhd   - Beyond-HD (type: bhd)
-        hawke - Hawke.uno (type: unit3d)
-        fnp   - FearNoPeer (type: unit3d)
-        fl    - FileList (type: filelist)
-        tl    - TorrentLeech (type: torrentleech)
+        bhd   - Beyond-HD (type: bhd, api_key + rss_key)
+        hawke - Hawke.uno (type: unit3d, api_key + rss_key)
+        fnp   - FearNoPeer (type: unit3d, api_key + rss_key)
+        fl    - FileList (type: filelist, username + passkey)
+        tl    - TorrentLeech (type: torrentleech, username + password)
 
       Config: ~/.config/trackers/config.json
 
