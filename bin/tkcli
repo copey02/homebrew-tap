@@ -12,6 +12,7 @@ import urllib.parse
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "trackers" / "config.json"
+TORRENT_CONFIG_PATH = Path.home() / ".config" / "torrent" / "config.json"
 
 # Resolution mappings for UNIT3D trackers
 UNIT3D_RESOLUTIONS = {
@@ -28,6 +29,108 @@ def load_config():
         sys.exit(1)
     with open(CONFIG_PATH) as f:
         return json.load(f)
+
+
+def load_torrent_config():
+    """Load torrent client config for trtcli integration"""
+    if not TORRENT_CONFIG_PATH.exists():
+        return None
+    with open(TORRENT_CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def add_to_torrent_client(url, trt_config):
+    """Add torrent URL to configured torrent client (Transmission or qBittorrent)"""
+    import base64
+
+    client = trt_config.get("client", "transmission").lower()
+
+    if client == "qbittorrent":
+        return add_to_qbittorrent(url, trt_config)
+    else:
+        return add_to_transmission_url(url, trt_config)
+
+
+def add_to_qbittorrent(url, config):
+    """Add torrent URL to qBittorrent"""
+    base_url = config["url"].rstrip("/")
+    username = config.get("username", "")
+    password = config.get("password", "")
+
+    # Login first
+    login_data = urllib.parse.urlencode({
+        "username": username,
+        "password": password
+    }).encode()
+
+    cookie = None
+    try:
+        req = urllib.request.Request(f"{base_url}/api/v2/auth/login", data=login_data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            cookie = resp.headers.get("Set-Cookie", "").split(";")[0]
+    except Exception as e:
+        return False, f"qBittorrent login failed: {e}"
+
+    # Add torrent
+    add_data = urllib.parse.urlencode({"urls": url}).encode()
+    headers = {"Cookie": cookie} if cookie else {}
+
+    try:
+        req = urllib.request.Request(f"{base_url}/api/v2/torrents/add", data=add_data, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = resp.read().decode()
+            if result == "Ok." or resp.status == 200:
+                return True, "Added to qBittorrent"
+            return False, f"qBittorrent error: {result}"
+    except Exception as e:
+        return False, f"qBittorrent error: {e}"
+
+
+def add_to_transmission_url(url, config):
+    """Add torrent URL to Transmission"""
+    import base64
+
+    rpc_url = config["url"]
+    auth_header = None
+    if config.get("username") and config.get("password"):
+        creds = f"{config['username']}:{config['password']}"
+        auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
+
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    # Get session ID
+    session_id = None
+    try:
+        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=b"{}")
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            session_id = e.headers.get("X-Transmission-Session-Id")
+        else:
+            return False, f"Transmission error: {e}"
+
+    if session_id:
+        headers["X-Transmission-Session-Id"] = session_id
+
+    body = json.dumps({
+        "method": "torrent-add",
+        "arguments": {"filename": url}
+    }).encode()
+
+    try:
+        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=body)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("result") == "success":
+                added = result.get("arguments", {}).get("torrent-added", {})
+                name = added.get("name", "Unknown")
+                return True, f"Added to Transmission: {name}"
+            else:
+                return False, f"Transmission error: {result.get('result', 'Unknown')}"
+    except Exception as e:
+        return False, f"Transmission error: {e}"
 
 
 def format_size(bytes_val):
@@ -188,6 +291,45 @@ def search(args, config):
     # Sort by seeders descending
     all_results.sort(key=lambda x: x["seeders"], reverse=True)
 
+    # If adding to torrent client, do it now
+    if args.add_to_trt:
+        trt_config = load_torrent_config()
+        if not trt_config:
+            print(f"Error: Torrent config not found at {TORRENT_CONFIG_PATH}")
+            return
+
+        # Parse which results to add (default: all, or specific numbers)
+        indices = []
+        if args.add_to_trt == "all" or args.add_to_trt is True:
+            indices = list(range(min(len(all_results), args.limit)))
+        else:
+            # Parse comma-separated or space-separated numbers
+            for part in args.add_to_trt.replace(",", " ").split():
+                try:
+                    idx = int(part) - 1  # Convert to 0-based
+                    if 0 <= idx < len(all_results):
+                        indices.append(idx)
+                except ValueError:
+                    pass
+
+        if not indices:
+            print("No valid result numbers specified")
+            return
+
+        added = 0
+        for idx in indices:
+            item = all_results[idx]
+            success, msg = add_to_torrent_client(item["download_url"], trt_config)
+            name = item["name"][:60]
+            if success:
+                print(f"Added: {name}")
+                added += 1
+            else:
+                print(f"Failed: {name} - {msg}")
+
+        print(f"\nAdded {added}/{len(indices)} torrents")
+        return
+
     # Print results
     print(f"\n{'#':<3} {'Tracker':<6} {'Name':<65} {'Size':>8} {'S':>4} {'L':>4}")
     print("-" * 95)
@@ -210,11 +352,25 @@ def search(args, config):
 
 
 def get(args, config):
-    """Download a torrent file by number from last search or direct URL"""
-    import tempfile
-    import os
-
+    """Download a torrent file or add directly to torrent client"""
     url = args.url_or_num
+
+    # If adding directly to torrent client, skip download
+    if args.add_to_trt:
+        trt_config = load_torrent_config()
+        if not trt_config:
+            print(f"Error: Torrent config not found at {TORRENT_CONFIG_PATH}")
+            sys.exit(1)
+
+        success, msg = add_to_torrent_client(url, trt_config)
+        if success:
+            print(msg)
+        else:
+            print(f"Failed: {msg}")
+            sys.exit(1)
+        return
+
+    # Download torrent file
     output_dir = Path(args.output or config.get("default_download_path", "."))
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -252,73 +408,9 @@ def get(args, config):
             print(f"Size: {size:.1f} KB")
             print(f"Path: {output_path}")
 
-            # Optionally add to Transmission
-            if args.add_to_tm:
-                add_to_transmission(output_path, config)
-
     except Exception as e:
         print(f"Download error: {e}")
         sys.exit(1)
-
-
-def add_to_transmission(torrent_path, config):
-    """Add torrent to Transmission via RPC"""
-    import base64
-
-    tm_config_path = Path.home() / ".config" / "transmission" / "config.json"
-    if not tm_config_path.exists():
-        print("Warning: Transmission config not found, skipping add")
-        return
-
-    with open(tm_config_path) as f:
-        tm_config = json.load(f)
-
-    with open(torrent_path, "rb") as f:
-        torrent_data = base64.b64encode(f.read()).decode()
-
-    url = tm_config["url"]
-    auth_header = None
-    if tm_config.get("username") and tm_config.get("password"):
-        import base64
-        creds = f"{tm_config['username']}:{tm_config['password']}"
-        auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
-
-    # Get session ID first
-    headers = {"Content-Type": "application/json"}
-    if auth_header:
-        headers["Authorization"] = auth_header
-
-    session_id = None
-    try:
-        req = urllib.request.Request(url, headers=headers, method="POST", data=b"{}")
-        urllib.request.urlopen(req, timeout=10)
-    except urllib.error.HTTPError as e:
-        if e.code == 409:
-            session_id = e.headers.get("X-Transmission-Session-Id")
-        else:
-            print(f"Transmission error: {e}")
-            return
-
-    if session_id:
-        headers["X-Transmission-Session-Id"] = session_id
-
-    body = json.dumps({
-        "method": "torrent-add",
-        "arguments": {"metainfo": torrent_data}
-    }).encode()
-
-    try:
-        req = urllib.request.Request(url, headers=headers, method="POST", data=body)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            if result.get("result") == "success":
-                added = result.get("arguments", {}).get("torrent-added", {})
-                name = added.get("name", "Unknown")
-                print(f"Added to Transmission: {name}")
-            else:
-                print(f"Transmission error: {result.get('result', 'Unknown error')}")
-    except Exception as e:
-        print(f"Transmission error: {e}")
 
 
 def recent(args, config):
@@ -357,6 +449,43 @@ def recent(args, config):
     # Sort by date descending (most recent first)
     all_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
 
+    # If adding to torrent client
+    if hasattr(args, 'add_to_trt') and args.add_to_trt:
+        trt_config = load_torrent_config()
+        if not trt_config:
+            print(f"Error: Torrent config not found at {TORRENT_CONFIG_PATH}")
+            return
+
+        indices = []
+        if args.add_to_trt == "all" or args.add_to_trt is True:
+            indices = list(range(min(len(all_results), args.limit)))
+        else:
+            for part in args.add_to_trt.replace(",", " ").split():
+                try:
+                    idx = int(part) - 1
+                    if 0 <= idx < len(all_results):
+                        indices.append(idx)
+                except ValueError:
+                    pass
+
+        if not indices:
+            print("No valid result numbers specified")
+            return
+
+        added = 0
+        for idx in indices:
+            item = all_results[idx]
+            success, msg = add_to_torrent_client(item["download_url"], trt_config)
+            name = item["name"][:60]
+            if success:
+                print(f"Added: {name}")
+                added += 1
+            else:
+                print(f"Failed: {name} - {msg}")
+
+        print(f"\nAdded {added}/{len(indices)} torrents")
+        return
+
     print(f"\n{'#':<3} {'Tracker':<6} {'Name':<65} {'Size':>8} {'S':>4}")
     print("-" * 90)
 
@@ -380,17 +509,17 @@ Examples:
   tk search "Oppenheimer" -t bhd       # Search Beyond-HD only
   tk search "Oppenheimer" -t hawke     # Search Hawke only
   tk search "Oppenheimer" -r 2160p     # Search for 4K
-  tk search "Oppenheimer" --no-default-res  # Search without resolution filter
-  tk search "Oppenheimer" --show-urls  # Show download URLs
-  tk get <url>                         # Download torrent file
-  tk get <url> --add-to-tm             # Download and add to Transmission
-  tk recent                            # Recent uploads across all trackers
+  tk search "Oppenheimer" -T           # Search and add all to torrent client
+  tk search "Oppenheimer" -T 1,2,3     # Add specific results to torrent client
+  tk get <url> -T                      # Add URL directly to torrent client
+  tk recent -T 1                       # Add first recent upload
   tk recent -t bhd                     # Recent from Beyond-HD
 
 Trackers: bhd (Beyond-HD), hawke (Hawke.uno)
 Default: 1080p resolution filter applied
 
-Config file: ~/.config/trackers/config.json
+Torrent client config: ~/.config/torrent/config.json
+Tracker config: ~/.config/trackers/config.json
 {
   "default_resolution": "1080p",
   "default_download_path": "~/Downloads/torrents",
@@ -422,18 +551,20 @@ Config file: ~/.config/trackers/config.json
     search_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
     search_p.add_argument("--no-default-res", action="store_true", help="Don't apply default resolution filter")
     search_p.add_argument("--show-urls", action="store_true", help="Show download URLs")
+    search_p.add_argument("-T", "--add-to-trt", nargs="?", const="all", help="Add to torrent client (all or specific #s: 1,2,3)")
 
     # Get/download command
     get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download torrent")
     get_p.add_argument("url_or_num", help="Download URL")
     get_p.add_argument("-o", "--output", help="Output directory")
-    get_p.add_argument("--add-to-tm", action="store_true", help="Add to Transmission after download")
+    get_p.add_argument("-T", "--add-to-trt", action="store_true", help="Add directly to torrent client")
 
     # Recent command
     recent_p = subparsers.add_parser("recent", aliases=["r"], help="Recent uploads")
     recent_p.add_argument("-t", "--tracker", help="Specific tracker")
     recent_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
     recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
+    recent_p.add_argument("-T", "--add-to-trt", nargs="?", const="all", help="Add to torrent client (all or specific #s: 1,2,3)")
 
     args = parser.parse_args()
 
