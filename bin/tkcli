@@ -39,16 +39,145 @@ def load_torrent_config():
         return json.load(f)
 
 
-def add_to_torrent_client(url, trt_config):
-    """Add torrent URL to configured torrent client (Transmission or qBittorrent)"""
+def add_to_torrent_client(url, trt_config, torrent_data=None):
+    """Add torrent URL or raw data to configured torrent client (Transmission or qBittorrent)"""
     import base64
 
     client = trt_config.get("client", "transmission").lower()
 
-    if client == "qbittorrent":
-        return add_to_qbittorrent(url, trt_config)
+    if torrent_data:
+        # Add by raw torrent file data
+        if client == "qbittorrent":
+            return add_to_qbittorrent_file(torrent_data, trt_config)
+        else:
+            return add_to_transmission_file(torrent_data, trt_config)
     else:
-        return add_to_transmission_url(url, trt_config)
+        # Add by URL
+        if client == "qbittorrent":
+            return add_to_qbittorrent(url, trt_config)
+        else:
+            return add_to_transmission_url(url, trt_config)
+
+
+def add_to_qbittorrent_file(torrent_data, config):
+    """Add torrent by raw file data to qBittorrent"""
+    import base64
+
+    base_url = config["url"].rstrip("/")
+    username = config.get("username", "")
+    password = config.get("password", "")
+
+    # Login first
+    login_data = urllib.parse.urlencode({
+        "username": username,
+        "password": password
+    }).encode()
+
+    cookie = None
+    try:
+        req = urllib.request.Request(f"{base_url}/api/v2/auth/login", data=login_data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            cookie = resp.headers.get("Set-Cookie", "").split(";")[0]
+    except Exception as e:
+        return False, f"qBittorrent login failed: {e}"
+
+    # Add torrent via multipart form data
+    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="torrents"; filename="torrent.torrent"\r\n'
+        f"Content-Type: application/x-bittorrent\r\n\r\n"
+    ).encode() + torrent_data + f"\r\n--{boundary}--\r\n".encode()
+
+    headers = {
+        "Cookie": cookie,
+        "Content-Type": f"multipart/form-data; boundary={boundary}"
+    }
+
+    try:
+        req = urllib.request.Request(f"{base_url}/api/v2/torrents/add", data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = resp.read().decode()
+            if result == "Ok." or resp.status == 200:
+                return True, "Added to qBittorrent"
+            return False, f"qBittorrent error: {result}"
+    except Exception as e:
+        return False, f"qBittorrent error: {e}"
+
+
+def add_to_transmission_file(torrent_data, config):
+    """Add torrent by raw file data to Transmission"""
+    import base64
+
+    rpc_url = config["url"]
+    auth_header = None
+    if config.get("username") and config.get("password"):
+        creds = f"{config['username']}:{config['password']}"
+        auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
+
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    # Get session ID
+    session_id = None
+    try:
+        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=b"{}")
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            session_id = e.headers.get("X-Transmission-Session-Id")
+        else:
+            return False, f"Transmission error: {e}"
+
+    if session_id:
+        headers["X-Transmission-Session-Id"] = session_id
+
+    # Transmission expects base64-encoded torrent data
+    metainfo = base64.b64encode(torrent_data).decode()
+
+    body = json.dumps({
+        "method": "torrent-add",
+        "arguments": {"metainfo": metainfo}
+    }).encode()
+
+    try:
+        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=body)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("result") == "success":
+                added = result.get("arguments", {}).get("torrent-added", {})
+                name = added.get("name", "Unknown")
+                return True, f"Added to Transmission: {name}"
+            else:
+                return False, f"Transmission error: {result.get('result', 'Unknown')}"
+    except Exception as e:
+        return False, f"Transmission error: {e}"
+
+
+def download_tl_torrent(url, tracker_config):
+    """Download torrent file from TorrentLeech using session auth"""
+    base_url = tracker_config["url"].rstrip("/")
+    username = tracker_config.get("username")
+    password = tracker_config.get("password")
+
+    if not username or not password:
+        return None, "TL requires username/password"
+
+    # Login
+    cookies, err = torrentleech_login(base_url, username, password)
+    if err:
+        return None, err
+
+    # Download torrent file
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        req.add_header("Cookie", cookies)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read(), None
+    except Exception as e:
+        return None, f"Download failed: {e}"
 
 
 def add_to_qbittorrent(url, config):
@@ -512,8 +641,19 @@ def search(args, config):
         added = 0
         for idx in indices:
             item = all_results[idx]
-            success, msg = add_to_torrent_client(item["download_url"], trt_config)
             name = item["name"][:60]
+
+            # TL requires session auth to download torrent files
+            if item.get("tracker") == "TL":
+                tl_config = config["trackers"].get("tl", {})
+                torrent_data, err = download_tl_torrent(item["download_url"], tl_config)
+                if err:
+                    print(f"Failed: {name} - {err}")
+                    continue
+                success, msg = add_to_torrent_client(None, trt_config, torrent_data=torrent_data)
+            else:
+                success, msg = add_to_torrent_client(item["download_url"], trt_config)
+
             if success:
                 print(f"Added: {name}")
                 added += 1
@@ -672,8 +812,19 @@ def recent(args, config):
         added = 0
         for idx in indices:
             item = all_results[idx]
-            success, msg = add_to_torrent_client(item["download_url"], trt_config)
             name = item["name"][:60]
+
+            # TL requires session auth to download torrent files
+            if item.get("tracker") == "TL":
+                tl_config = config["trackers"].get("tl", {})
+                torrent_data, err = download_tl_torrent(item["download_url"], tl_config)
+                if err:
+                    print(f"Failed: {name} - {err}")
+                    continue
+                success, msg = add_to_torrent_client(None, trt_config, torrent_data=torrent_data)
+            else:
+                success, msg = add_to_torrent_client(item["download_url"], trt_config)
+
             if success:
                 print(f"Added: {name}")
                 added += 1
