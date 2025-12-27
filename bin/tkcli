@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tracker CLI - Search and download torrents from private trackers
-Supports: Beyond-HD, Hawke.uno (UNIT3D)
+Supports: Beyond-HD, Hawke/FNP (UNIT3D), FileList, TorrentLeech
 """
 
 import argparse
@@ -251,6 +251,109 @@ def unit3d_search(query, config, tracker_name, limit=50, resolution=None):
     return results
 
 
+def filelist_search(query, config, tracker_name, limit=50, resolution=None):
+    """Search FileList tracker"""
+    tracker = config["trackers"][tracker_name]
+    base_url = tracker["url"].rstrip("/")
+
+    # Append resolution to query if specified
+    search_query = query
+    if resolution and resolution.lower() not in query.lower():
+        search_query = f"{query} {resolution}"
+
+    params = {
+        "username": tracker["username"],
+        "passkey": tracker["passkey"],
+        "action": "search-torrents",
+        "type": "name",
+        "query": search_query,
+        "limit": limit,
+    }
+
+    url = f"{base_url}/api.php?{urllib.parse.urlencode(params)}"
+
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"FL API Error: {e.code} {e.reason}")
+        return []
+    except Exception as e:
+        print(f"FL API Error: {e}")
+        return []
+
+    if isinstance(result, dict) and result.get("error"):
+        print(f"FL Error: {result.get('error')}")
+        return []
+
+    results = []
+    for item in result[:limit] if isinstance(result, list) else []:
+        results.append({
+            "tracker": "FL",
+            "id": item.get("id"),
+            "name": item.get("name", ""),
+            "size": item.get("size", 0),
+            "seeders": item.get("seeders", 0),
+            "leechers": item.get("leechers", 0),
+            "download_url": f"{base_url}/download.php?id={item.get('id')}&passkey={tracker['passkey']}",
+            "page_url": f"{base_url}/details.php?id={item.get('id')}",
+            "freeleech": item.get("freeleech", 0) == 1,
+            "internal": item.get("internal", 0) == 1,
+            "created_at": item.get("upload_date", ""),
+        })
+
+    return results
+
+
+def torrentleech_search(query, config, tracker_name, limit=50, resolution=None):
+    """Search TorrentLeech tracker"""
+    tracker = config["trackers"][tracker_name]
+    base_url = tracker["url"].rstrip("/")
+
+    # Append resolution to query if specified
+    search_query = query
+    if resolution and resolution.lower() not in query.lower():
+        search_query = f"{query} {resolution}"
+
+    # TorrentLeech API endpoint
+    encoded_query = urllib.parse.quote(search_query)
+    url = f"{base_url}/api/torrent/search/{encoded_query}/page/1/by/added/sort/desc/apikey/{tracker['api_key']}"
+
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"TL API Error: {e.code} {e.reason}")
+        return []
+    except Exception as e:
+        print(f"TL API Error: {e}")
+        return []
+
+    results = []
+    torrents = result.get("torrentList", result) if isinstance(result, dict) else result
+    if not isinstance(torrents, list):
+        torrents = []
+
+    for item in torrents[:limit]:
+        results.append({
+            "tracker": "TL",
+            "id": item.get("fid") or item.get("id"),
+            "name": item.get("name", ""),
+            "size": item.get("size", 0),
+            "seeders": item.get("seeders", 0),
+            "leechers": item.get("leechers", 0),
+            "download_url": f"{base_url}/download/{item.get('fid') or item.get('id')}/{tracker['api_key']}",
+            "page_url": f"{base_url}/torrent/{item.get('fid') or item.get('id')}",
+            "freeleech": item.get("freeleech", False),
+            "internal": False,
+            "created_at": item.get("addedTimestamp", ""),
+        })
+
+    return results
+
+
 def search(args, config):
     query = args.query
     resolution = config.get("default_resolution", "1080p")
@@ -279,6 +382,10 @@ def search(args, config):
 
         if tracker_type == "bhd":
             results = bhd_search(query, config, args.limit, resolution)
+        elif tracker_type == "filelist":
+            results = filelist_search(query, config, tracker_name, args.limit, resolution)
+        elif tracker_type == "torrentleech":
+            results = torrentleech_search(query, config, tracker_name, args.limit, resolution)
         else:
             results = unit3d_search(query, config, tracker_name, args.limit, resolution)
 
@@ -437,6 +544,10 @@ def recent(args, config):
         # Use empty query for recent
         if tracker_type == "bhd":
             results = bhd_search("", config, args.limit, resolution)
+        elif tracker_type == "filelist":
+            results = filelist_search("", config, tracker_name, args.limit, resolution)
+        elif tracker_type == "torrentleech":
+            results = torrentleech_search("", config, tracker_name, args.limit, resolution)
         else:
             results = unit3d_search("", config, tracker_name, args.limit, resolution)
 
@@ -507,37 +618,14 @@ def main():
 Examples:
   tk search "Oppenheimer"              # Search all trackers (1080p default)
   tk search "Oppenheimer" -t bhd       # Search Beyond-HD only
-  tk search "Oppenheimer" -t hawke     # Search Hawke only
-  tk search "Oppenheimer" -r 2160p     # Search for 4K
+  tk search "Oppenheimer" -t fl        # Search FileList only
+  tk search "Oppenheimer" -t tl        # Search TorrentLeech only
   tk search "Oppenheimer" -T           # Search and add all to torrent client
-  tk search "Oppenheimer" -T 1,2,3     # Add specific results to torrent client
-  tk get <url> -T                      # Add URL directly to torrent client
-  tk recent -T 1                       # Add first recent upload
-  tk recent -t bhd                     # Recent from Beyond-HD
+  tk search "Oppenheimer" -T 1,2,3     # Add specific results
+  tk recent -t hawke                   # Recent from Hawke
 
-Trackers: bhd (Beyond-HD), hawke (Hawke.uno)
-Default: 1080p resolution filter applied
-
-Torrent client config: ~/.config/torrent/config.json
-Tracker config: ~/.config/trackers/config.json
-{
-  "default_resolution": "1080p",
-  "default_download_path": "~/Downloads/torrents",
-  "trackers": {
-    "bhd": {
-      "type": "bhd",
-      "url": "https://beyond-hd.me",
-      "api_key": "your-api-key",
-      "rss_key": "your-rss-key"
-    },
-    "hawke": {
-      "type": "unit3d",
-      "url": "https://hawke.uno",
-      "api_key": "your-api-token",
-      "rss_key": "your-rss-key"
-    }
-  }
-}
+Trackers: bhd, hawke, fnp (UNIT3D), fl (FileList), tl (TorrentLeech)
+Config: ~/.config/trackers/config.json
         """
     )
 
