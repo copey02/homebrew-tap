@@ -18,7 +18,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mediacli" / "config.json"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # Common video extensions
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
@@ -332,7 +332,7 @@ def cmd_info(args):
     """Show detected info for files"""
     if not ensure_ffprobe_available(args.probe):
         return
-    files = collect_video_files(args.path)
+    files = collect_video_files(args.path, recursive=args.recursive)
 
     if not files:
         print("No video files found")
@@ -377,7 +377,7 @@ def cmd_rename(args):
     config = load_config()
     if not ensure_ffprobe_available(args.probe):
         return
-    files = collect_video_files(args.path)
+    files = collect_video_files(args.path, recursive=args.recursive)
 
     if not files:
         print("No video files found")
@@ -504,7 +504,7 @@ def cmd_organize(args):
     config = load_config()
     if not ensure_ffprobe_available(args.probe):
         return
-    files = collect_video_files(args.path)
+    files = collect_video_files(args.path, recursive=args.recursive)
 
     if not files:
         print("No video files found")
@@ -628,7 +628,7 @@ def cmd_config(args):
 # Helpers
 # =============================================================================
 
-def get_video_files(path):
+def get_video_files(path, recursive=False):
     """Get video files from path"""
     p = Path(path).expanduser()
     if p.is_file():
@@ -637,9 +637,10 @@ def get_video_files(path):
         return []
     elif p.is_dir():
         files = []
+        matcher = p.rglob if recursive else p.glob
         for ext in VIDEO_EXTENSIONS:
-            files.extend(p.glob(f"*{ext}"))
-            files.extend(p.glob(f"*{ext.upper()}"))
+            files.extend(matcher(f"*{ext}"))
+            files.extend(matcher(f"*{ext.upper()}"))
         return sorted(files)
     return []
 
@@ -667,12 +668,12 @@ def expand_paths(paths):
     return expanded
 
 
-def collect_video_files(paths):
+def collect_video_files(paths, recursive=False):
     """Collect video files from multiple input paths."""
     files = []
     seen = set()
     for raw in expand_paths(paths):
-        for f in get_video_files(raw):
+        for f in get_video_files(raw, recursive=recursive):
             if f not in seen:
                 files.append(f)
                 seen.add(f)
@@ -1110,6 +1111,7 @@ Examples:
   media search "Breaking Bad"          Search TMDB
   media info ~/Downloads/*.mkv         Show detected info
   media info ~/Downloads/*.mkv --probe Use ffprobe for stream metadata
+  media rename ~/Downloads/ -r         Include subdirectories
   media rename ~/Downloads/ --dry-run  Preview renames
   media rename ~/Downloads/ -y         Rename without confirm
   media organize ~/Downloads/          Move to TV/Movie folders
@@ -1140,6 +1142,7 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_info = subparsers.add_parser("info", help="Show detected info for files")
     p_info.add_argument("path", nargs="+", help="Files or directories to analyze")
     p_info.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
+    p_info.add_argument("--recursive", "-r", action="store_true", help="Search subdirectories")
 
     # rename
     p_rename = subparsers.add_parser("rename", help="Rename files using TMDB")
@@ -1149,6 +1152,7 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_rename.add_argument("--pattern", "-p", help="Custom naming pattern")
     p_rename.add_argument("--interactive", "-i", action="store_true", help="Select matches interactively")
     p_rename.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
+    p_rename.add_argument("--recursive", "-r", action="store_true", help="Search subdirectories")
     p_rename.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],
@@ -1164,6 +1168,7 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_org.add_argument("--tv-folder", help="TV shows destination")
     p_org.add_argument("--movie-folder", help="Movies destination")
     p_org.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
+    p_org.add_argument("--recursive", "-r", action="store_true", help="Search subdirectories")
     p_org.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],

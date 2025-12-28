@@ -104,5 +104,18 @@ class CollisionTests(unittest.TestCase):
             self.assertEqual(result, [])
 
 
+class FileCollectionTests(unittest.TestCase):
+    def test_collect_video_files_recursive(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            nested = tmp / "Season 01"
+            nested.mkdir()
+            (nested / "episode.mkv").write_text("x")
+
+            files = mediacli.collect_video_files([str(tmp)], recursive=True)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].name.endswith(".mkv"))
+
+
 if __name__ == "__main__":
     unittest.main()

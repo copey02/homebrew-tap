@@ -1,9 +1,9 @@
 class Mediacli < Formula
   desc "Media CLI - Rename and organize movies & TV shows using TMDB (FileBot alternative)"
   homepage "https://github.com/copey02/homebrew-tap"
-  version "1.2.2"
+  version "1.2.3"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/v#{version}/bin/mediacli"
-  sha256 "07e8df6c39e8e689e7f9189ca6fb4ce8a7e75908043fdf8bd6df0dbee8144429"
+  sha256 "3ebd28580d2eb05be8919478ad7939a69ea969a8f45a3d72224fbfd6b9fc6460"
   license "MIT"
 
   depends_on "python@3"
@@ -25,6 +25,7 @@ class Mediacli < Formula
         media search "Breaking Bad"          Search TMDB
         media info ~/Downloads/              Show detected info
         media info ~/Downloads/ --probe      Use ffprobe metadata
+        media rename ~/Downloads/ -r         Include subdirectories
         media rename ~/Downloads/ --dry-run  Preview renames
         media rename ~/Downloads/ -y         Rename files
         media organize ~/Downloads/          Move to TV/Movie folders
