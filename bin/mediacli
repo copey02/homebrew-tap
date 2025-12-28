@@ -18,7 +18,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mediacli" / "config.json"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # Common video extensions
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
@@ -1152,8 +1152,8 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_rename.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],
-        default="abort",
-        help="Collision handling for destination files (default: abort)"
+        default="skip",
+        help="Collision handling for destination files (default: skip)"
     )
 
     # organize
@@ -1167,8 +1167,8 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_org.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],
-        default="abort",
-        help="Collision handling for destination files (default: abort)"
+        default="skip",
+        help="Collision handling for destination files (default: skip)"
     )
 
     # config

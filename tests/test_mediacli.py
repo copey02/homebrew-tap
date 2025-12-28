@@ -90,6 +90,19 @@ class CollisionTests(unittest.TestCase):
             for d in dests:
                 self.assertNotEqual(d.name, "out.mkv")
 
+    def test_resolve_collisions_skip_existing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "a.mkv"
+            dest = tmp / "out.mkv"
+            src.write_text("a")
+            dest.write_text("existing")
+
+            ops = [(src, dest)]
+            result = mediacli.resolve_collisions(ops, "skip")
+
+            self.assertEqual(result, [])
+
 
 if __name__ == "__main__":
     unittest.main()
