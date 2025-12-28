@@ -2,8 +2,8 @@ class Sonarrcli < Formula
   desc "Sonarr CLI - Manage TV series and downloads via Sonarr API"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/sonarrcli"
-  version "1.0.3"
-  sha256 "af3bb7b94dd45e61af9b0d403cfa56ec87bd34d036a45c4eabf31170da247b49"
+  version "1.0.4"
+  sha256 "00fca9baafa22beb7c754e5f52530fa38563798b49a373736f5643a4f6384bef"
   license "MIT"
 
   depends_on "python@3"

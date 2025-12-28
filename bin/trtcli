@@ -5,23 +5,60 @@ Torrent CLI - Control Transmission or qBittorrent from the command line
 
 import argparse
 import json
+import os
 import sys
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import http.cookiejar
 from pathlib import Path
 from abc import ABC, abstractmethod
 
-CONFIG_PATH = Path.home() / ".config" / "torrent" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "TRTCLI_CONFIG_PATH",
+    os.environ.get("TORRENT_CONFIG_PATH", str(Path.home() / ".config" / "torrent" / "config.json"))
+))
+VERSION = "1.1.1"
+USER_AGENT = f"TRTCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 def load_config():
-    if not CONFIG_PATH.exists():
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error reading config: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif not (os.getenv("TRT_URL") or os.getenv("TRT_CLIENT")):
         print(f"Error: Config not found at {CONFIG_PATH}")
         print("Create it with: client, url, username, password")
         print("  client: 'transmission' or 'qbittorrent'")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+
+    env_client = os.getenv("TRT_CLIENT")
+    env_url = os.getenv("TRT_URL")
+    env_user = os.getenv("TRT_USERNAME")
+    env_pass = os.getenv("TRT_PASSWORD")
+
+    if env_client:
+        config["client"] = env_client
+    if env_url:
+        config["url"] = env_url
+    if env_user:
+        config["username"] = env_user
+    if env_pass:
+        config["password"] = env_pass
+
+    if not config.get("url"):
+        print("Error: torrent client url is required (config url or TRT_URL)", file=sys.stderr)
+        sys.exit(1)
+
+    return config
 
 def format_size(bytes_val):
     if bytes_val < 0:
@@ -57,6 +94,79 @@ def format_eta(seconds):
         return f"{int(minutes)}m {int(secs)}s"
     return f"{int(secs)}s"
 
+
+def request_json(url, headers=None, data=None, method="GET", retries=3):
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content = resp.read().decode()
+                if not content:
+                    return {}
+                return json.loads(content)
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def request_text(url, headers=None, data=None, method="GET", retries=3):
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read().decode(), resp.status
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def open_with_retry(open_func, req, retries=3):
+    for attempt in range(retries):
+        try:
+            return open_func(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def confirm_action(prompt, assume_yes=False):
+    if assume_yes:
+        return True
+    response = input(f"{prompt} [y/N]: ").strip().lower()
+    return response in ("y", "yes")
 
 class TorrentClient(ABC):
     """Abstract base class for torrent clients"""
@@ -116,6 +226,7 @@ class TransmissionClient(TorrentClient):
 
     def _request(self, method, arguments):
         headers = {"Content-Type": "application/json"}
+        headers["User-Agent"] = USER_AGENT
 
         if self.config.get("username") and self.config.get("password"):
             import base64
@@ -126,19 +237,14 @@ class TransmissionClient(TorrentClient):
             headers["X-Transmission-Session-Id"] = self.session_id
 
         payload = json.dumps({"method": method, "arguments": arguments}).encode()
-        req = urllib.request.Request(self.url, data=payload, headers=headers)
-
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
+            return request_json(self.url, headers=headers, data=payload, method="POST")
         except urllib.error.HTTPError as e:
             if e.code == 409:
                 self.session_id = e.headers.get("X-Transmission-Session-Id")
                 if self.session_id:
                     headers["X-Transmission-Session-Id"] = self.session_id
-                    req = urllib.request.Request(self.url, data=payload, headers=headers)
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        return json.loads(resp.read().decode())
+                    return request_json(self.url, headers=headers, data=payload, method="POST")
             raise
 
     def list_torrents(self, filter_type=None):
@@ -303,8 +409,8 @@ class QBittorrentClient(TorrentClient):
             "username": self.config.get("username", "admin"),
             "password": self.config.get("password", ""),
         }).encode()
-        req = urllib.request.Request(login_url, data=data)
-        with self.opener.open(req, timeout=30) as resp:
+        req = urllib.request.Request(login_url, data=data, headers={"User-Agent": USER_AGENT})
+        with open_with_retry(self.opener.open, req) as resp:
             result = resp.read().decode()
             if result != "Ok.":
                 raise Exception(f"Login failed: {result}")
@@ -316,13 +422,17 @@ class QBittorrentClient(TorrentClient):
 
         if data and method == "GET":
             url = f"{url}?{urllib.parse.urlencode(data)}"
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         elif data:
-            req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode())
+            req = urllib.request.Request(
+                url,
+                data=urllib.parse.urlencode(data).encode(),
+                headers={"User-Agent": USER_AGENT}
+            )
         else:
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
-        with self.opener.open(req, timeout=30) as resp:
+        with open_with_retry(self.opener.open, req) as resp:
             content = resp.read().decode()
             if content:
                 try:
@@ -592,6 +702,13 @@ def list_cmd(args, client):
 
     torrents = client.list_torrents(filter_type)
 
+    if args.json:
+        print(json.dumps({
+            "filter": filter_type,
+            "torrents": torrents,
+        }, indent=2))
+        return
+
     if not torrents:
         print("No torrents" + (f" with filter '{filter_type}'" if filter_type else ""))
         return
@@ -628,6 +745,10 @@ def info_cmd(args, client):
         print(f"Torrent {args.id} not found")
         return
 
+    if args.json:
+        print(json.dumps(t, indent=2))
+        return
+
     print(f"\n{t['name']}")
     print("-" * 60)
     print(f"ID:         {t['id']}")
@@ -651,29 +772,63 @@ def info_cmd(args, client):
 
 def add_cmd(args, client):
     result_id, msg = client.add_torrent(args.source, args.paused, args.download_dir)
-    if result_id:
+    if args.json:
+        print(json.dumps({
+            "success": bool(result_id),
+            "message": msg,
+        }, indent=2))
+    elif result_id:
         print(f"Added: {msg}")
     else:
         print(f"Failed: {msg}")
 
 def remove_cmd(args, client):
-    if client.remove_torrents(args.ids, args.delete_data):
-        print(f"Removed {len(args.ids)} torrent(s)" + (" and data" if args.delete_data else ""))
+    count = len(args.ids)
+    target = "all torrents" if args.ids == ["all"] else f"{count} torrent(s)"
+    if not confirm_action(f"Remove {target}?", args.yes):
+        print("Aborted")
+        return
+
+    success = client.remove_torrents(args.ids, args.delete_data)
+    if args.json:
+        print(json.dumps({
+            "success": bool(success),
+            "count": count,
+            "delete_data": args.delete_data,
+        }, indent=2))
+    elif success:
+        print(f"Removed {count} torrent(s)" + (" and data" if args.delete_data else ""))
     else:
         print("Failed to remove torrents")
 
 def start_cmd(args, client):
     ids = None if args.ids == ["all"] else args.ids
-    if client.start_torrents(ids):
+    success = client.start_torrents(ids)
+    if args.json:
+        print(json.dumps({
+            "success": bool(success),
+            "count": len(args.ids),
+        }, indent=2))
+    elif success:
         print(f"Started {'all torrents' if ids is None else f'{len(ids)} torrent(s)'}")
 
 def stop_cmd(args, client):
     ids = None if args.ids == ["all"] else args.ids
-    if client.stop_torrents(ids):
+    success = client.stop_torrents(ids)
+    if args.json:
+        print(json.dumps({
+            "success": bool(success),
+            "count": len(args.ids),
+        }, indent=2))
+    elif success:
         print(f"Stopped {'all torrents' if ids is None else f'{len(ids)} torrent(s)'}")
 
 def stats_cmd(args, client):
     s = client.get_stats()
+
+    if args.json:
+        print(json.dumps(s, indent=2))
+        return
 
     print(f"\nActive:     {s['active']} torrents")
     print(f"Paused:     {s['paused']} torrents")
@@ -692,11 +847,21 @@ def stats_cmd(args, client):
 def speed_cmd(args, client):
     if args.down is not None or args.up is not None:
         client.set_speed_limits(args.down, args.up)
-        print("Speed limits updated")
+        if args.json:
+            print(json.dumps({
+                "status": "updated",
+                "down": args.down,
+                "up": args.up,
+            }, indent=2))
+        else:
+            print("Speed limits updated")
     else:
         limits = client.get_speed_limits()
-        print(f"Download: {limits['down_limit']} KB/s" if limits['down_enabled'] else "Download: unlimited")
-        print(f"Upload:   {limits['up_limit']} KB/s" if limits['up_enabled'] else "Upload:   unlimited")
+        if args.json:
+            print(json.dumps(limits, indent=2))
+        else:
+            print(f"Download: {limits['down_limit']} KB/s" if limits['down_enabled'] else "Download: unlimited")
+            print(f"Upload:   {limits['up_limit']} KB/s" if limits['up_enabled'] else "Upload:   unlimited")
 
 def watch_cmd(args, client):
     import time
@@ -756,6 +921,8 @@ Config:   ~/.config/torrent/config.json
         """
     )
 
+    parser.add_argument("-j", "--json", action="store_true", help="Output as JSON")
+
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # List
@@ -782,6 +949,7 @@ Config:   ~/.config/torrent/config.json
     rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove torrents")
     rm_p.add_argument("ids", nargs="+", help="Torrent IDs or hashes")
     rm_p.add_argument("--delete-data", action="store_true", help="Delete downloaded data")
+    rm_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
 
     # Start
     start_p = subparsers.add_parser("start", aliases=["st"], help="Start torrents")

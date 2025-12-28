@@ -2,7 +2,8 @@ class Tidarrcli < Formula
   desc "Tidarr CLI - Browse Tidal catalog and manage Tidarr downloads"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/tidarrcli"
-  version "1.0.0"
+  version "1.0.1"
+  sha256 "8107039d963f5d39b8c73502fabe4f5f499b017602924903b79309c46c65f818"
   license "MIT"
 
   depends_on "python@3"

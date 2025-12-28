@@ -6,14 +6,25 @@ Supports: Beyond-HD, Hawke/FNP (UNIT3D), FileList, TorrentLeech
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.request
 import urllib.parse
+import urllib.error
+import time
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "trackers" / "config.json"
-TORRENT_CONFIG_PATH = Path.home() / ".config" / "torrent" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "TKCLI_CONFIG_PATH",
+    str(Path.home() / ".config" / "trackers" / "config.json")
+))
+TORRENT_CONFIG_PATH = Path(os.environ.get(
+    "TRTCLI_CONFIG_PATH",
+    os.environ.get("TORRENT_CONFIG_PATH", str(Path.home() / ".config" / "torrent" / "config.json"))
+))
+VERSION = "1.3.3"
+USER_AGENT = f"TKCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 # Resolution mappings for UNIT3D trackers
 UNIT3D_RESOLUTIONS = {
@@ -23,21 +34,80 @@ UNIT3D_RESOLUTIONS = {
     "720p": "5",
 }
 
+def request_json(url, headers=None, data=None, method="GET", retries=3):
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def request_bytes(url, headers=None, data=None, method="GET", retries=3):
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read(), resp.headers
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
 def load_config():
     if not CONFIG_PATH.exists():
         print(f"Error: Config file not found at {CONFIG_PATH}")
         print("Create it with tracker configs. See --help for format.")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error reading config: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def load_torrent_config():
     """Load torrent client config for trtcli integration"""
     if not TORRENT_CONFIG_PATH.exists():
         return None
-    with open(TORRENT_CONFIG_PATH) as f:
-        return json.load(f)
+    try:
+        with open(TORRENT_CONFIG_PATH) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"Error: invalid JSON in {TORRENT_CONFIG_PATH}", file=sys.stderr)
+        return None
+    except OSError as e:
+        print(f"Error reading torrent config: {e}", file=sys.stderr)
+        return None
 
 
 def add_to_torrent_client(url, trt_config, torrent_data=None):
@@ -76,9 +146,13 @@ def add_to_qbittorrent_file(torrent_data, config):
 
     cookie = None
     try:
-        req = urllib.request.Request(f"{base_url}/api/v2/auth/login", data=login_data)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            cookie = resp.headers.get("Set-Cookie", "").split(";")[0]
+        _, resp_headers = request_bytes(
+            f"{base_url}/api/v2/auth/login",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=login_data,
+            method="POST",
+        )
+        cookie = resp_headers.get("Set-Cookie", "").split(";")[0]
     except Exception as e:
         return False, f"qBittorrent login failed: {e}"
 
@@ -96,12 +170,16 @@ def add_to_qbittorrent_file(torrent_data, config):
     }
 
     try:
-        req = urllib.request.Request(f"{base_url}/api/v2/torrents/add", data=body, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = resp.read().decode()
-            if result == "Ok." or resp.status == 200:
-                return True, "Added to qBittorrent"
-            return False, f"qBittorrent error: {result}"
+        content, _ = request_bytes(
+            f"{base_url}/api/v2/torrents/add",
+            headers=headers,
+            data=body,
+            method="POST",
+        )
+        text = content.decode() if isinstance(content, (bytes, bytearray)) else str(content)
+        if text == "Ok.":
+            return True, "Added to qBittorrent"
+        return False, f"qBittorrent error: {text}"
     except Exception as e:
         return False, f"qBittorrent error: {e}"
 
@@ -116,7 +194,7 @@ def add_to_transmission_file(torrent_data, config):
         creds = f"{config['username']}:{config['password']}"
         auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if auth_header:
         headers["Authorization"] = auth_header
 
@@ -143,15 +221,12 @@ def add_to_transmission_file(torrent_data, config):
     }).encode()
 
     try:
-        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=body)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-            if result.get("result") == "success":
-                added = result.get("arguments", {}).get("torrent-added", {})
-                name = added.get("name", "Unknown")
-                return True, f"Added to Transmission: {name}"
-            else:
-                return False, f"Transmission error: {result.get('result', 'Unknown')}"
+        result = request_json(rpc_url, headers=headers, data=body, method="POST")
+        if result.get("result") == "success":
+            added = result.get("arguments", {}).get("torrent-added", {})
+            name = added.get("name", "Unknown")
+            return True, f"Added to Transmission: {name}"
+        return False, f"Transmission error: {result.get('result', 'Unknown')}"
     except Exception as e:
         return False, f"Transmission error: {e}"
 
@@ -172,11 +247,14 @@ def download_tl_torrent(url, tracker_config):
 
     # Download torrent file
     try:
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
-        req.add_header("Cookie", cookies)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read(), None
+        content, _ = request_bytes(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Cookie": cookies,
+            },
+        )
+        return content, None
     except Exception as e:
         return None, f"Download failed: {e}"
 
@@ -195,9 +273,13 @@ def add_to_qbittorrent(url, config):
 
     cookie = None
     try:
-        req = urllib.request.Request(f"{base_url}/api/v2/auth/login", data=login_data)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            cookie = resp.headers.get("Set-Cookie", "").split(";")[0]
+        _, resp_headers = request_bytes(
+            f"{base_url}/api/v2/auth/login",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=login_data,
+            method="POST",
+        )
+        cookie = resp_headers.get("Set-Cookie", "").split(";")[0]
     except Exception as e:
         return False, f"qBittorrent login failed: {e}"
 
@@ -206,12 +288,16 @@ def add_to_qbittorrent(url, config):
     headers = {"Cookie": cookie} if cookie else {}
 
     try:
-        req = urllib.request.Request(f"{base_url}/api/v2/torrents/add", data=add_data, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = resp.read().decode()
-            if result == "Ok." or resp.status == 200:
-                return True, "Added to qBittorrent"
-            return False, f"qBittorrent error: {result}"
+        content, _ = request_bytes(
+            f"{base_url}/api/v2/torrents/add",
+            headers=headers,
+            data=add_data,
+            method="POST",
+        )
+        text = content.decode() if isinstance(content, (bytes, bytearray)) else str(content)
+        if text == "Ok.":
+            return True, "Added to qBittorrent"
+        return False, f"qBittorrent error: {text}"
     except Exception as e:
         return False, f"qBittorrent error: {e}"
 
@@ -226,7 +312,7 @@ def add_to_transmission_url(url, config):
         creds = f"{config['username']}:{config['password']}"
         auth_header = "Basic " + base64.b64encode(creds.encode()).decode()
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if auth_header:
         headers["Authorization"] = auth_header
 
@@ -250,15 +336,12 @@ def add_to_transmission_url(url, config):
     }).encode()
 
     try:
-        req = urllib.request.Request(rpc_url, headers=headers, method="POST", data=body)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-            if result.get("result") == "success":
-                added = result.get("arguments", {}).get("torrent-added", {})
-                name = added.get("name", "Unknown")
-                return True, f"Added to Transmission: {name}"
-            else:
-                return False, f"Transmission error: {result.get('result', 'Unknown')}"
+        result = request_json(rpc_url, headers=headers, data=body, method="POST")
+        if result.get("result") == "success":
+            added = result.get("arguments", {}).get("torrent-added", {})
+            name = added.get("name", "Unknown")
+            return True, f"Added to Transmission: {name}"
+        return False, f"Transmission error: {result.get('result', 'Unknown')}"
     except Exception as e:
         return False, f"Transmission error: {e}"
 
@@ -297,16 +380,14 @@ def bhd_search(query, config, limit=50, resolution=None):
     }
 
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
+        result = request_json(
+            url,
+            headers={"Content-Type": "application/json"},
+            data=data,
+            method="POST"
+        )
     except Exception as e:
         print(f"BHD API Error: {e}")
         return []
@@ -333,56 +414,62 @@ def bhd_search(query, config, limit=50, resolution=None):
     return results
 
 
-def unit3d_search(query, config, tracker_name, limit=50, resolution=None):
+def unit3d_search(query, config, tracker_name, limit=50, resolution=None, page=1, fetch_all=False):
     """Search UNIT3D-based tracker (Hawke, etc.)"""
     tracker = config["trackers"][tracker_name]
     base_url = tracker["url"].rstrip("/")
-
-    params = {
-        "name": query,
-        "perPage": limit,
-    }
-
-    if resolution and resolution in UNIT3D_RESOLUTIONS:
-        params["resolutions[]"] = UNIT3D_RESOLUTIONS[resolution]
-
-    url = f"{base_url}/api/torrents/filter?{urllib.parse.urlencode(params)}"
-
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {tracker['api_key']}",
-            "Accept": "application/json",
-        },
-        method="GET"
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        print(f"{tracker_name.upper()} API Error: {e.code} {e.reason}")
-        return []
-    except Exception as e:
-        print(f"{tracker_name.upper()} API Error: {e}")
-        return []
-
     results = []
-    for item in result.get("data", []):
-        attrs = item.get("attributes", item)
-        results.append({
-            "tracker": tracker_name.upper(),
-            "id": item.get("id") or attrs.get("id"),
-            "name": attrs.get("name", ""),
-            "size": attrs.get("size", 0),
-            "seeders": attrs.get("seeders", 0),
-            "leechers": attrs.get("leechers", 0),
-            "download_url": f"{base_url}/torrent/download/{item.get('id')}.{tracker['rss_key']}",
-            "page_url": f"{base_url}/torrents/{item.get('id')}",
-            "freeleech": attrs.get("freeleech", False) or attrs.get("free", "0%") != "0%",
-            "internal": attrs.get("internal", False),
-            "created_at": attrs.get("created_at", ""),
-        })
+    current_page = page
+
+    while True:
+        params = {
+            "name": query,
+            "perPage": limit,
+            "page": current_page,
+        }
+
+        if resolution and resolution in UNIT3D_RESOLUTIONS:
+            params["resolutions[]"] = UNIT3D_RESOLUTIONS[resolution]
+
+        url = f"{base_url}/api/torrents/filter?{urllib.parse.urlencode(params)}"
+
+        try:
+            result = request_json(
+                url,
+                headers={
+                    "Authorization": f"Bearer {tracker['api_key']}",
+                    "Accept": "application/json",
+                },
+            )
+        except urllib.error.HTTPError as e:
+            print(f"{tracker_name.upper()} API Error: {e.code} {e.reason}")
+            return []
+        except Exception as e:
+            print(f"{tracker_name.upper()} API Error: {e}")
+            return []
+
+        page_items = result.get("data", [])
+        for item in page_items:
+            attrs = item.get("attributes", item)
+            results.append({
+                "tracker": tracker_name.upper(),
+                "id": item.get("id") or attrs.get("id"),
+                "name": attrs.get("name", ""),
+                "size": attrs.get("size", 0),
+                "seeders": attrs.get("seeders", 0),
+                "leechers": attrs.get("leechers", 0),
+                "download_url": f"{base_url}/torrent/download/{item.get('id')}.{tracker['rss_key']}",
+                "page_url": f"{base_url}/torrents/{item.get('id')}",
+                "freeleech": attrs.get("freeleech", False) or attrs.get("free", "0%") != "0%",
+                "internal": attrs.get("internal", False),
+                "created_at": attrs.get("created_at", ""),
+            })
+
+        if not fetch_all:
+            break
+        if not page_items or len(page_items) < limit:
+            break
+        current_page += 1
 
     return results
 
@@ -409,9 +496,7 @@ def filelist_search(query, config, tracker_name, limit=50, resolution=None):
     url = f"{base_url}/api.php?{urllib.parse.urlencode(params)}"
 
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
+        result = request_json(url)
     except urllib.error.HTTPError as e:
         print(f"FL API Error: {e.code} {e.reason}")
         return []
@@ -532,13 +617,15 @@ def torrentleech_search(query, config, tracker_name, limit=50, resolution=None):
     search_url = f"{base_url}/torrents/browse/list/query/{urllib.parse.quote(search_query)}"
 
     try:
-        req = urllib.request.Request(search_url)
-        req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
-        req.add_header("Cookie", cookies)
-        req.add_header("Accept", "application/json")
-        req.add_header("X-Requested-With", "XMLHttpRequest")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+        data = request_json(
+            search_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Cookie": cookies,
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
     except urllib.error.HTTPError as e:
         print(f"TL Search Error: {e.code} {e.reason}")
         return []
@@ -586,6 +673,7 @@ def search(args, config):
         resolution = None
 
     all_results = []
+    unsupported_paging = []
 
     # Determine which trackers to search
     trackers_to_search = []
@@ -603,22 +691,39 @@ def search(args, config):
         tracker_type = tracker.get("type", "unit3d")
 
         if tracker_type == "bhd":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = bhd_search(query, config, args.limit, resolution)
         elif tracker_type == "filelist":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = filelist_search(query, config, tracker_name, args.limit, resolution)
         elif tracker_type == "torrentleech":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = torrentleech_search(query, config, tracker_name, args.limit, resolution)
         else:
-            results = unit3d_search(query, config, tracker_name, args.limit, resolution)
+            results = unit3d_search(query, config, tracker_name, args.limit, resolution, args.page, args.all)
 
         all_results.extend(results)
 
     if not all_results:
-        print("No results found")
+        if args.json:
+            print(json.dumps({
+                "query": query,
+                "results": [],
+                "warnings": unsupported_paging,
+            }, indent=2))
+        else:
+            print("No results found")
         return
 
     # Sort by seeders descending
     all_results.sort(key=lambda x: x["seeders"], reverse=True)
+
+    if unsupported_paging and not args.json:
+        warn_list = ", ".join(sorted(set(unsupported_paging)))
+        print(f"Warning: paging not supported for {warn_list}")
 
     # If adding to torrent client, do it now
     if args.add_to_trt:
@@ -646,6 +751,7 @@ def search(args, config):
             return
 
         added = 0
+        added_results = []
         for idx in indices:
             item = all_results[idx]
             name = item["name"][:60]
@@ -662,12 +768,36 @@ def search(args, config):
                 success, msg = add_to_torrent_client(item["download_url"], trt_config)
 
             if success:
-                print(f"Added: {name}")
+                if not args.json:
+                    print(f"Added: {name}")
                 added += 1
             else:
-                print(f"Failed: {name} - {msg}")
+                if not args.json:
+                    print(f"Failed: {name} - {msg}")
 
-        print(f"\nAdded {added}/{len(indices)} torrents")
+            added_results.append({
+                "name": item["name"],
+                "success": success,
+                "message": msg,
+            })
+
+        if args.json:
+            print(json.dumps({
+                "query": query,
+                "results": all_results,
+                "added": added_results,
+                "warnings": unsupported_paging,
+            }, indent=2))
+        else:
+            print(f"\nAdded {added}/{len(indices)} torrents")
+        return
+
+    if args.json:
+        print(json.dumps({
+            "query": query,
+            "results": all_results,
+            "warnings": unsupported_paging,
+        }, indent=2))
         return
 
     # Print results
@@ -703,10 +833,16 @@ def get(args, config):
             sys.exit(1)
 
         success, msg = add_to_torrent_client(url, trt_config)
-        if success:
+        if args.json:
+            print(json.dumps({
+                "success": success,
+                "message": msg,
+            }, indent=2))
+        elif success:
             print(msg)
         else:
             print(f"Failed: {msg}")
+        if not success:
             sys.exit(1)
         return
 
@@ -724,30 +860,34 @@ def get(args, config):
             break
 
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read()
+        content, resp_headers = request_bytes(url, headers=headers)
 
-            # Try to get filename from Content-Disposition
-            cd = resp.headers.get("Content-Disposition", "")
-            filename = None
-            if "filename=" in cd:
-                import re
-                match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
-                if match:
-                    filename = match.group(1).strip()
+        # Try to get filename from Content-Disposition
+        cd = resp_headers.get("Content-Disposition", "")
+        filename = None
+        if "filename=" in cd:
+            match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+            if match:
+                filename = match.group(1).strip()
 
-            if not filename:
-                filename = "download.torrent"
-            filename = sanitize_filename(filename)
-            if not filename.lower().endswith(".torrent"):
-                filename = f"{filename}.torrent"
+        if not filename:
+            filename = "download.torrent"
+        filename = sanitize_filename(filename)
+        if not filename.lower().endswith(".torrent"):
+            filename = f"{filename}.torrent"
 
-            output_path = output_dir / filename
-            with open(output_path, "wb") as f:
-                f.write(content)
+        output_path = output_dir / filename
+        with open(output_path, "wb") as f:
+            f.write(content)
 
-            size = output_path.stat().st_size / 1024
+        size = output_path.stat().st_size / 1024
+        if args.json:
+            print(json.dumps({
+                "filename": filename,
+                "size_kb": round(size, 1),
+                "path": str(output_path),
+            }, indent=2))
+        else:
             print(f"Downloaded: {filename}")
             print(f"Size: {size:.1f} KB")
             print(f"Path: {output_path}")
@@ -764,6 +904,7 @@ def recent(args, config):
         resolution = None
 
     all_results = []
+    unsupported_paging = []
 
     trackers_to_search = []
     if args.tracker:
@@ -780,22 +921,38 @@ def recent(args, config):
 
         # Use empty query for recent
         if tracker_type == "bhd":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = bhd_search("", config, args.limit, resolution)
         elif tracker_type == "filelist":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = filelist_search("", config, tracker_name, args.limit, resolution)
         elif tracker_type == "torrentleech":
+            if args.page != 1 or args.all:
+                unsupported_paging.append(tracker_name)
             results = torrentleech_search("", config, tracker_name, args.limit, resolution)
         else:
-            results = unit3d_search("", config, tracker_name, args.limit, resolution)
+            results = unit3d_search("", config, tracker_name, args.limit, resolution, args.page, args.all)
 
         all_results.extend(results)
 
     if not all_results:
-        print("No results found")
+        if args.json:
+            print(json.dumps({
+                "results": [],
+                "warnings": unsupported_paging,
+            }, indent=2))
+        else:
+            print("No results found")
         return
 
     # Sort by date descending (most recent first)
     all_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+    if unsupported_paging and not args.json:
+        warn_list = ", ".join(sorted(set(unsupported_paging)))
+        print(f"Warning: paging not supported for {warn_list}")
 
     # If adding to torrent client
     if hasattr(args, 'add_to_trt') and args.add_to_trt:
@@ -821,6 +978,7 @@ def recent(args, config):
             return
 
         added = 0
+        added_results = []
         for idx in indices:
             item = all_results[idx]
             name = item["name"][:60]
@@ -837,12 +995,34 @@ def recent(args, config):
                 success, msg = add_to_torrent_client(item["download_url"], trt_config)
 
             if success:
-                print(f"Added: {name}")
+                if not args.json:
+                    print(f"Added: {name}")
                 added += 1
             else:
-                print(f"Failed: {name} - {msg}")
+                if not args.json:
+                    print(f"Failed: {name} - {msg}")
 
-        print(f"\nAdded {added}/{len(indices)} torrents")
+            added_results.append({
+                "name": item["name"],
+                "success": success,
+                "message": msg,
+            })
+
+        if args.json:
+            print(json.dumps({
+                "results": all_results,
+                "added": added_results,
+                "warnings": unsupported_paging,
+            }, indent=2))
+        else:
+            print(f"\nAdded {added}/{len(indices)} torrents")
+        return
+
+    if args.json:
+        print(json.dumps({
+            "results": all_results,
+            "warnings": unsupported_paging,
+        }, indent=2))
         return
 
     print(f"\n{'#':<3} {'Tracker':<6} {'Name':<65} {'Size':>8} {'S':>4}")
@@ -877,6 +1057,8 @@ Config: ~/.config/trackers/config.json
         """
     )
 
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Search command
@@ -885,6 +1067,8 @@ Config: ~/.config/trackers/config.json
     search_p.add_argument("-t", "--tracker", help="Specific tracker (bhd, hawke)")
     search_p.add_argument("-r", "--resolution", help="Resolution filter (1080p, 2160p, 720p)")
     search_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
+    search_p.add_argument("--page", type=int, default=1, help="Page number (UNIT3D only)")
+    search_p.add_argument("--all", action="store_true", help="Fetch all pages (UNIT3D only)")
     search_p.add_argument("--no-default-res", action="store_true", help="Don't apply default resolution filter")
     search_p.add_argument("--show-urls", action="store_true", help="Show download URLs")
     search_p.add_argument("-T", "--add-to-trt", nargs="?", const="all", help="Add to torrent client (all or specific #s: 1,2,3)")
@@ -899,6 +1083,8 @@ Config: ~/.config/trackers/config.json
     recent_p = subparsers.add_parser("recent", aliases=["r"], help="Recent uploads")
     recent_p.add_argument("-t", "--tracker", help="Specific tracker")
     recent_p.add_argument("-l", "--limit", type=int, default=25, help="Max results (default: 25)")
+    recent_p.add_argument("--page", type=int, default=1, help="Page number (UNIT3D only)")
+    recent_p.add_argument("--all", action="store_true", help="Fetch all pages (UNIT3D only)")
     recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
     recent_p.add_argument("-T", "--add-to-trt", nargs="?", const="all", help="Add to torrent client (all or specific #s: 1,2,3)")
 

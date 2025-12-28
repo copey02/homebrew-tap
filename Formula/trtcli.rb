@@ -2,8 +2,8 @@ class Trtcli < Formula
   desc "Torrent CLI - Control Transmission or qBittorrent from the command line"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/trtcli"
-  version "1.1.0"
-  sha256 "e492e6ec9611e7429b90e9bdd6841335d5e485f502b8314eabfea8b488fef5e2"
+  version "1.1.1"
+  sha256 "0269ab3abb6f9dcd0a4a8157fb331a67c150699639e060cfc3c8bb785d3291ef"
   license "MIT"
 
   depends_on "python@3"

@@ -2,8 +2,8 @@ class Foodcli < Formula
   desc "FoodCLI - Nutrition lookup from USDA and Open Food Facts"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/foodcli"
-  version "1.1.0"
-  sha256 "ad17748b321de3d8654a8667a2b51d71b802a28b179df7a4c3f49db6ade0848b"
+  version "1.1.1"
+  sha256 "1b5727976784ec1e15b213dd21188b2d02624e20279ec467f44931008edc62cd"
   license "MIT"
 
   depends_on "python@3"

@@ -5,12 +5,20 @@ FoodCLI - Search and fetch nutrition data from USDA FoodData Central and Open Fo
 
 import argparse
 import json
+import os
 import sys
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "foodcli" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "FOODCLI_CONFIG_PATH",
+    str(Path.home() / ".config" / "foodcli" / "config.json")
+))
+VERSION = "1.1.1"
+USER_AGENT = f"FoodCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 USDA_API_BASE = "https://api.nal.usda.gov/fdc/v1"
 OFF_API_BASE = "https://world.openfoodfacts.org"
@@ -36,35 +44,65 @@ KEY_NUTRIENTS = {
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        return {}
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error reading config: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    env_key = os.getenv("FOODCLI_USDA_API_KEY") or os.getenv("FOODCLI_API_KEY")
+    if env_key:
+        config["api_key"] = env_key
+
+    return config
 
 
-def http_request(url, data=None, headers=None):
-    """Make HTTP request and return JSON response"""
+def http_request(url, data=None, headers=None, method=None, retries=3):
+    """Make HTTP request and return JSON response."""
     headers = headers or {}
-    if data:
-        req = urllib.request.Request(url, data=json.dumps(data).encode(),
-                                      headers={"Content-Type": "application/json", **headers})
-    else:
-        req = urllib.request.Request(url, headers=headers)
+    headers.setdefault("User-Agent", USER_AGENT)
 
-    # Add User-Agent for Open Food Facts (they require it)
-    req.add_header("User-Agent", "FoodCLI/1.1 (https://github.com/copey02/homebrew-tap)")
+    payload = None
+    if data is not None:
+        payload = json.dumps(data).encode()
+        headers.setdefault("Content-Type", "application/json")
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if e.fp else str(e)
-        print(f"Error: API returned {e.code}", file=sys.stderr)
-        print(error_body[:500], file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers=headers,
+        method=method or ("POST" if payload is not None else "GET")
+    )
+
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            error_body = e.read().decode() if e.fp else str(e)
+            print(f"Error: API returned {e.code}", file=sys.stderr)
+            print(error_body[:500], file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 # =============================================================================
@@ -75,14 +113,14 @@ def usda_search(args):
     """Search USDA FoodData Central"""
     config = load_config()
     if not config.get("api_key"):
-        print("Error: USDA requires api_key in ~/.config/foodcli/config.json", file=sys.stderr)
+        print(f"Error: USDA requires api_key in {CONFIG_PATH}", file=sys.stderr)
+        print("You can also set FOODCLI_USDA_API_KEY.", file=sys.stderr)
         print("Get free key at: https://fdc.nal.usda.gov/api-key-signup.html", file=sys.stderr)
         sys.exit(1)
 
     params = {
         "query": args.query,
         "pageSize": args.limit,
-        "pageNumber": args.page,
     }
 
     if args.type:
@@ -98,28 +136,41 @@ def usda_search(args):
         params["brandOwner"] = args.brand
 
     url = f"{USDA_API_BASE}/foods/search?api_key={config['api_key']}"
-    data = http_request(url, data=params)
 
     results = []
-    for food in data.get("foods", []):
-        item = {
-            "id": food.get("fdcId"),
-            "description": food.get("description"),
-            "dataType": food.get("dataType"),
-            "brand": food.get("brandOwner") or food.get("brandName"),
-            "servingSize": food.get("servingSize"),
-            "servingSizeUnit": food.get("servingSizeUnit"),
-        }
-        if food.get("foodNutrients"):
-            item["nutrients"] = extract_usda_nutrients(food["foodNutrients"])
-        results.append(item)
+    page = args.page
+    total_hits = 0
+    total_pages = 1
+
+    while True:
+        params["pageNumber"] = page
+        data = http_request(url, data=params)
+        total_hits = data.get("totalHits", total_hits)
+        total_pages = data.get("totalPages", total_pages)
+
+        for food in data.get("foods", []):
+            item = {
+                "id": food.get("fdcId"),
+                "description": food.get("description"),
+                "dataType": food.get("dataType"),
+                "brand": food.get("brandOwner") or food.get("brandName"),
+                "servingSize": food.get("servingSize"),
+                "servingSizeUnit": food.get("servingSizeUnit"),
+            }
+            if food.get("foodNutrients"):
+                item["nutrients"] = extract_usda_nutrients(food["foodNutrients"])
+            results.append(item)
+
+        if not args.all or page >= total_pages:
+            break
+        page += 1
 
     return {
         "source": "usda",
         "query": args.query,
-        "totalHits": data.get("totalHits", 0),
-        "currentPage": data.get("currentPage", 1),
-        "totalPages": data.get("totalPages", 1),
+        "totalHits": total_hits,
+        "currentPage": args.page,
+        "totalPages": total_pages,
         "foods": results
     }
 
@@ -128,7 +179,8 @@ def usda_info(food_id, include_all=False):
     """Get USDA food details"""
     config = load_config()
     if not config.get("api_key"):
-        print("Error: USDA requires api_key in ~/.config/foodcli/config.json", file=sys.stderr)
+        print(f"Error: USDA requires api_key in {CONFIG_PATH}", file=sys.stderr)
+        print("You can also set FOODCLI_USDA_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
     url = f"{USDA_API_BASE}/food/{food_id}?api_key={config['api_key']}&format=full"
@@ -184,28 +236,41 @@ def off_search(args):
         "page": args.page,
         "json": 1,
     }
-    url = f"{OFF_API_BASE}/cgi/search.pl?{urllib.parse.urlencode(params)}"
-    data = http_request(url)
-
     results = []
-    for product in data.get("products", []):
-        nutrients = extract_off_nutrients(product.get("nutriments", {}))
-        item = {
-            "id": product.get("code"),
-            "description": product.get("product_name") or product.get("product_name_en") or "Unknown",
-            "dataType": "OpenFoodFacts",
-            "brand": product.get("brands"),
-            "servingSize": product.get("serving_size"),
-            "nutrients": nutrients,
-        }
-        results.append(item)
+    page = args.page
+    total_hits = 0
+    total_pages = 1
+
+    while True:
+        params["page"] = page
+        url = f"{OFF_API_BASE}/cgi/search.pl?{urllib.parse.urlencode(params)}"
+        data = http_request(url)
+
+        total_hits = data.get("count", total_hits)
+        total_pages = data.get("page_count", total_pages)
+
+        for product in data.get("products", []):
+            nutrients = extract_off_nutrients(product.get("nutriments", {}))
+            item = {
+                "id": product.get("code"),
+                "description": product.get("product_name") or product.get("product_name_en") or "Unknown",
+                "dataType": "OpenFoodFacts",
+                "brand": product.get("brands"),
+                "servingSize": product.get("serving_size"),
+                "nutrients": nutrients,
+            }
+            results.append(item)
+
+        if not args.all or page >= total_pages:
+            break
+        page += 1
 
     return {
         "source": "off",
         "query": args.query,
-        "totalHits": data.get("count", 0),
-        "currentPage": data.get("page", 1),
-        "totalPages": data.get("page_count", 1),
+        "totalHits": total_hits,
+        "currentPage": args.page,
+        "totalPages": total_pages,
         "foods": results
     }
 
@@ -427,6 +492,7 @@ Config (~/.config/foodcli/config.json):
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("-l", "--limit", type=int, default=25, help="Results per page")
     search_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    search_p.add_argument("--all", action="store_true", help="Fetch all pages")
     search_p.add_argument("--type", choices=["branded", "foundation", "survey", "legacy"],
                           help="Filter by data type (USDA only)")
     search_p.add_argument("--brand", help="Filter by brand (USDA only)")

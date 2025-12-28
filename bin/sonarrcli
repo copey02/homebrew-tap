@@ -6,14 +6,21 @@ Supports multiple Sonarr instances (e.g., main + 4K)
 
 import argparse
 import json
+import os
 import sys
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "sonarr" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "SONARRCLI_CONFIG_PATH",
+    str(Path.home() / ".config" / "sonarr" / "config.json")
+))
+VERSION = "1.0.4"
+USER_AGENT = f"SonarrCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 # Cache for series lookup
 _series_cache = {}
@@ -29,12 +36,56 @@ def get_series_lookup(instance):
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error reading config: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif not (os.getenv("SONARR_URL") or os.getenv("SONARR_API_KEY")):
         print(f"Error: Config file not found at {CONFIG_PATH}")
         print("Create it with your Sonarr instance(s). See --help for format.")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+
+    return apply_env_overrides(config)
+
+
+def apply_env_overrides(config):
+    """Override config values with environment variables."""
+    env_url = os.getenv("SONARR_URL")
+    env_api_key = os.getenv("SONARR_API_KEY")
+    env_instance = os.getenv("SONARR_INSTANCE")
+    env_default_instance = os.getenv("SONARR_DEFAULT_INSTANCE")
+    env_root = os.getenv("SONARR_DEFAULT_ROOT_FOLDER")
+    env_quality = os.getenv("SONARR_DEFAULT_QUALITY_PROFILE")
+
+    if env_default_instance:
+        config["default_instance"] = env_default_instance
+    if env_root:
+        config["default_root_folder"] = env_root
+    if env_quality:
+        config["default_quality_profile"] = env_quality
+
+    if env_url or env_api_key:
+        if config.get("instances"):
+            name = env_instance or config.get("default_instance") or "main"
+            config.setdefault("instances", {}).setdefault(name, {})
+            if env_url:
+                config["instances"][name]["url"] = env_url
+            if env_api_key:
+                config["instances"][name]["api_key"] = env_api_key
+        else:
+            if env_url:
+                config["url"] = env_url
+            if env_api_key:
+                config["api_key"] = env_api_key
+
+    return config
 
 
 def get_instance(config, instance_name=None):
@@ -48,7 +99,8 @@ def get_instance(config, instance_name=None):
         print("Error: No instances configured")
         sys.exit(1)
 
-    name = instance_name or config.get("default_instance", "main")
+    env_instance = os.getenv("SONARR_INSTANCE")
+    name = instance_name or env_instance or config.get("default_instance", "main")
     if name not in instances:
         print(f"Error: Instance '{name}' not found")
         print(f"Available: {', '.join(instances.keys())}")
@@ -57,7 +109,7 @@ def get_instance(config, instance_name=None):
     return instances[name]
 
 
-def api_request(instance, endpoint, method="GET", data=None, params=None):
+def api_request(instance, endpoint, method="GET", data=None, params=None, retries=3):
     """Make API request to Sonarr instance."""
     base_url = instance["url"].rstrip("/")
     api_key = instance["api_key"]
@@ -70,35 +122,44 @@ def api_request(instance, endpoint, method="GET", data=None, params=None):
         "X-Api-Key": api_key,
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": USER_AGENT,
     }
 
     body = None
     if data:
         body = json.dumps(data).encode("utf-8")
 
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            response_data = resp.read().decode()
-            if response_data:
-                return json.loads(response_data)
-            return {}
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if e.fp else ""
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            error_json = json.loads(error_body)
-            msg = error_json.get("message", error_body)
-        except json.JSONDecodeError:
-            msg = error_body or str(e)
-        print(f"API Error ({e.code}): {msg}", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Connection Error: {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                response_data = resp.read().decode()
+                if response_data:
+                    return json.loads(response_data)
+                return {}
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            error_body = e.read().decode() if e.fp else ""
+            try:
+                error_json = json.loads(error_body)
+                msg = error_json.get("message", error_body)
+            except json.JSONDecodeError:
+                msg = error_body or str(e)
+            print(f"API Error ({e.code}): {msg}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            print(f"Connection Error: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def format_size(bytes_val):
@@ -142,6 +203,42 @@ def truncate(text, length):
     if len(text) <= length:
         return text
     return text[:length - 1] + "…"
+
+
+def confirm_action(prompt, assume_yes=False):
+    if assume_yes:
+        return True
+    response = input(f"{prompt} [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
+def fetch_paged_records(instance, endpoint, params, fetch_all):
+    """Fetch a page or all pages from a Sonarr endpoint with records."""
+    start_page = params.get("page", 1)
+    all_records = []
+    total_records = 0
+
+    page = start_page
+    while True:
+        params["page"] = page
+        result = api_request(instance, endpoint, params=params)
+        records = result.get("records", [])
+        total_records = result.get("totalRecords", total_records or len(records))
+
+        if not fetch_all:
+            return result, records, total_records
+
+        if records:
+            all_records.extend(records)
+
+        if not records or len(all_records) >= total_records:
+            result["records"] = all_records
+            result["page"] = start_page
+            result["pageSize"] = params.get("pageSize")
+            result["totalRecords"] = total_records
+            return result, all_records, total_records
+
+        page += 1
 
 
 # =============================================================================
@@ -508,13 +605,19 @@ def cmd_queue(args, config):
     """Show download queue."""
     instance = get_instance(config, args.instance)
 
-    params = {"page": 1, "pageSize": args.limit, "includeSeries": "true", "includeEpisode": "true"}
-    result = api_request(instance, "queue", params=params)
-
-    records = result.get("records", [])
+    params = {
+        "page": args.page,
+        "pageSize": args.limit,
+        "includeSeries": "true",
+        "includeEpisode": "true",
+    }
+    result, records, total = fetch_paged_records(instance, "queue", params, args.all)
 
     if not records:
-        print("Queue is empty")
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("Queue is empty")
         return
 
     if args.json:
@@ -547,7 +650,6 @@ def cmd_queue(args, config):
 
         print(f"{q_id:<6} {series:<30} {ep_str:<12} {quality:<12} {status:<15} {progress_str:>8}")
 
-    total = result.get("totalRecords", len(records))
     print(f"\nShowing {len(records)} of {total} items")
 
 
@@ -580,6 +682,10 @@ def cmd_grab(args, config):
 def cmd_remove(args, config):
     """Remove item from queue."""
     instance = get_instance(config, args.instance)
+
+    if not confirm_action(f"Remove queue item {args.queue_id}?", args.yes):
+        print("Aborted")
+        return
 
     params = {
         "removeFromClient": "true" if args.from_client else "false",
@@ -669,11 +775,13 @@ def cmd_wanted(args, config):
         "includeSeries": "true",
     }
 
-    result = api_request(instance, "wanted/missing", params=params)
-    records = result.get("records", [])
+    result, records, total = fetch_paged_records(instance, "wanted/missing", params, args.all)
 
     if not records:
-        print("No missing episodes")
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("No missing episodes")
         return
 
     if args.json:
@@ -696,8 +804,10 @@ def cmd_wanted(args, config):
 
         print(f"{ep_id:<8} {series:<35} {ep_str:<10} {title:<30} {air_date:<12}")
 
-    total = result.get("totalRecords", len(records))
-    print(f"\nPage {args.page}: {len(records)} of {total} missing episodes")
+    if args.all:
+        print(f"\nShowing {len(records)} of {total} missing episodes")
+    else:
+        print(f"\nPage {args.page}: {len(records)} of {total} missing episodes")
 
 
 def cmd_cutoff(args, config):
@@ -710,11 +820,13 @@ def cmd_cutoff(args, config):
         "includeSeries": "true",
     }
 
-    result = api_request(instance, "wanted/cutoff", params=params)
-    records = result.get("records", [])
+    result, records, total = fetch_paged_records(instance, "wanted/cutoff", params, args.all)
 
     if not records:
-        print("No episodes below cutoff")
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("No episodes below cutoff")
         return
 
     if args.json:
@@ -741,8 +853,10 @@ def cmd_cutoff(args, config):
 
         print(f"{ep_id:<8} {series:<30} {ep_str:<10} {current:<15} {cutoff:<15}")
 
-    total = result.get("totalRecords", len(records))
-    print(f"\nPage {args.page}: {len(records)} of {total} episodes below cutoff")
+    if args.all:
+        print(f"\nShowing {len(records)} of {total} episodes below cutoff")
+    else:
+        print(f"\nPage {args.page}: {len(records)} of {total} episodes below cutoff")
 
 
 # =============================================================================
@@ -765,11 +879,13 @@ def cmd_history(args, config):
     if args.series_id:
         params["seriesId"] = args.series_id
 
-    result = api_request(instance, "history", params=params)
-    records = result.get("records", [])
+    result, records, total = fetch_paged_records(instance, "history", params, args.all)
 
     if not records:
-        print("No history")
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("No history")
         return
 
     if args.json:
@@ -793,8 +909,10 @@ def cmd_history(args, config):
 
         print(f"{date:<18} {event:<15} {series:<30} {ep_str:<10} {quality:<12}")
 
-    total = result.get("totalRecords", len(records))
-    print(f"\nPage {args.page}: {len(records)} of {total} history items")
+    if args.all:
+        print(f"\nShowing {len(records)} of {total} history items")
+    else:
+        print(f"\nPage {args.page}: {len(records)} of {total} history items")
 
 
 def cmd_import(args, config):
@@ -1356,6 +1474,8 @@ Config file: ~/.config/sonarr/config.json
     # --- Queue commands ---
     queue_p = subparsers.add_parser("queue", aliases=["q"], help="Show download queue")
     queue_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
+    queue_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    queue_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     status_p = subparsers.add_parser("status", help="Show queue status")
 
@@ -1366,6 +1486,7 @@ Config file: ~/.config/sonarr/config.json
     remove_p.add_argument("queue_id", type=int, help="Queue item ID")
     remove_p.add_argument("--from-client", action="store_true", help="Also remove from download client")
     remove_p.add_argument("--blocklist", action="store_true", help="Add to blocklist")
+    remove_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
 
     # --- Calendar & Wanted ---
     calendar_p = subparsers.add_parser("calendar", aliases=["cal"], help="Show upcoming episodes")
@@ -1375,16 +1496,19 @@ Config file: ~/.config/sonarr/config.json
     wanted_p = subparsers.add_parser("wanted", aliases=["w"], help="Show missing episodes")
     wanted_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
     wanted_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    wanted_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     cutoff_p = subparsers.add_parser("cutoff", help="Show episodes below cutoff")
     cutoff_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
     cutoff_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    cutoff_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     # --- History & Import ---
     history_p = subparsers.add_parser("history", aliases=["h"], help="Show download history")
     history_p.add_argument("-l", "--limit", type=int, default=25, help="Max results")
     history_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
     history_p.add_argument("-s", "--series-id", type=int, help="Filter by series ID")
+    history_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     import_p = subparsers.add_parser("import", aliases=["im"], help="Manual import")
     import_p.add_argument("path", help="Path to import from")

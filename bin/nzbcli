@@ -8,12 +8,22 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "nzbgeek" / "config.json"
-SAB_CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "NZBCLI_CONFIG_PATH",
+    str(Path.home() / ".config" / "nzbgeek" / "config.json")
+))
+SAB_CONFIG_PATH = Path(os.environ.get(
+    "SAB_CONFIG_PATH",
+    str(Path.home() / ".config" / "sabnzbd" / "config.json")
+))
+VERSION = "1.1.2"
+USER_AGENT = f"NZBCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 # NZBgeek categories
 CATEGORIES = {
@@ -26,24 +36,69 @@ CATEGORIES = {
 }
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        print(f"Error: Config file not found at {CONFIG_PATH}")
-        print("Create it with: api_key, api_url, default_download_path, default_resolution")
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error reading config: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    env_api_key = os.getenv("NZBCLI_API_KEY")
+    env_api_url = os.getenv("NZBCLI_API_URL")
+    env_download = os.getenv("NZBCLI_DEFAULT_DOWNLOAD_PATH")
+    env_res = os.getenv("NZBCLI_DEFAULT_RESOLUTION")
+    if env_api_key:
+        config["api_key"] = env_api_key
+    if env_api_url:
+        config["api_url"] = env_api_url
+    if env_download:
+        config["default_download_path"] = env_download
+    if env_res:
+        config["default_resolution"] = env_res
+
+    if not config.get("api_key") or not config.get("api_url"):
+        print(f"Error: Config missing api_key/api_url at {CONFIG_PATH}", file=sys.stderr)
+        print("Create it with: api_key, api_url, default_download_path, default_resolution", file=sys.stderr)
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+
+    return config
+
+
+def request_json(url, headers=None, retries=3):
+    """Request JSON with retries/backoff."""
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    req = urllib.request.Request(url, headers=headers)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            print(f"API Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            print(f"API Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
 def api_request(endpoint, params, config):
     params["apikey"] = config["api_key"]
     params["o"] = "json"
     url = f"{config['api_url']}?{urllib.parse.urlencode(params)}"
-
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as e:
-        print(f"API Error: {e}")
-        sys.exit(1)
+    return request_json(url)
 
 def format_size(bytes_val):
     gb = int(bytes_val) / 1024 / 1024 / 1024
@@ -56,10 +111,28 @@ def sanitize_filename(name, default="download"):
     return base if base else default
 
 def load_sab_config():
-    if not SAB_CONFIG_PATH.exists():
-        return None
-    with open(SAB_CONFIG_PATH) as f:
-        return json.load(f)
+    config = {}
+    if SAB_CONFIG_PATH.exists():
+        try:
+            with open(SAB_CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {SAB_CONFIG_PATH}", file=sys.stderr)
+            return None
+        except OSError as e:
+            print(f"Error reading SAB config: {e}", file=sys.stderr)
+            return None
+
+    env_url = os.getenv("SAB_URL")
+    env_key = os.getenv("SAB_API_KEY")
+    if env_url:
+        config["url"] = env_url
+    if env_key:
+        config["api_key"] = env_key
+
+    if config.get("url") and config.get("api_key"):
+        return config
+    return None
 
 def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
     """Add NZB to SABnzbd via URL"""
@@ -74,11 +147,9 @@ def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
 
     url = f"{sab_config['url']}/api?{urllib.parse.urlencode(params)}"
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-            return result.get("status", False)
-    except Exception as e:
-        print(f"SABnzbd error: {e}")
+        result = request_json(url)
+        return result.get("status", False)
+    except SystemExit:
         return False
 
 def search(args, config):
@@ -90,30 +161,15 @@ def search(args, config):
         if res.lower() not in query.lower():
             query = f"{query} {res}"
 
+    offset = args.offset
+    if args.page and args.offset == 0:
+        offset = max(args.page - 1, 0) * args.limit
+
     params = {"t": "search", "q": query, "limit": args.limit}
 
     if args.cat:
         cat = CATEGORIES.get(args.cat, args.cat)
         params["cat"] = cat
-
-    if args.offset:
-        params["offset"] = args.offset
-
-    data = api_request("", params, config)
-
-    # Get total from response
-    response = data.get("channel", {}).get("response", {}).get("@attributes", {})
-    total = int(response.get("total", 0))
-    offset = int(response.get("offset", 0))
-
-    items = data.get("channel", {}).get("item", [])
-
-    if isinstance(items, dict):
-        items = [items]
-
-    if not items:
-        print("No results found")
-        return
 
     # Load SAB config if adding to SABnzbd
     sab_config = None
@@ -123,53 +179,119 @@ def search(args, config):
             print("Error: SABnzbd config not found at ~/.config/sabnzbd/config.json")
             sys.exit(1)
 
-    # Pagination info
-    start = offset + 1
-    end = offset + len(items)
-
     added_count = 0
+    all_items = []
+    total = 0
+    start_offset = offset
 
-    if not args.add_to_sab:
-        print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
-        print("-" * 105)
+    if offset:
+        params["offset"] = offset
 
-    for item in items:
-        title = item.get("title", "")
-        size = format_size(item.get("enclosure", {}).get("@attributes", {}).get("length", 0))
-        date = item.get("pubDate", "")[:12]
+    while True:
+        data = api_request("", params, config)
 
-        # Get GUID for easy copying
-        attrs = item.get("attr", [])
-        if isinstance(attrs, dict):
-            attrs = [attrs]
-        elif attrs is None:
-            attrs = []
-        guid = ""
-        for attr in attrs:
-            if attr.get("@attributes", {}).get("name") == "guid":
-                guid = attr.get("@attributes", {}).get("value", "")
-                break
+        response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+        total = int(response.get("total", total))
+        offset = int(response.get("offset", offset))
 
-        if args.add_to_sab and guid:
-            # Build NZB download URL and add to SABnzbd
-            nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
-            if add_to_sabnzbd(nzb_url, sab_config, title):
-                print(f"Added: {title[:70]}")
-                added_count += 1
+        items = data.get("channel", {}).get("item", [])
+        if isinstance(items, dict):
+            items = [items]
+
+        if not items and not all_items:
+            if args.json:
+                print(json.dumps({
+                    "query": args.query,
+                    "total": total,
+                    "offset": start_offset,
+                    "limit": args.limit,
+                    "items": [],
+                }, indent=2))
             else:
-                print(f"Failed: {title[:70]}")
-        else:
-            print(f"{title[:79]:<80} {size:>10} {date:<12}")
-            if args.show_guid:
-                print(f"  GUID: {guid}")
+                print("No results found")
+            return
+
+        page_items = []
+        for item in items:
+            title = item.get("title", "")
+            size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
+            size = format_size(size_bytes)
+            date = item.get("pubDate", "")[:12]
+
+            attrs = item.get("attr", [])
+            if isinstance(attrs, dict):
+                attrs = [attrs]
+            elif attrs is None:
+                attrs = []
+            guid = ""
+            for attr in attrs:
+                if attr.get("@attributes", {}).get("name") == "guid":
+                    guid = attr.get("@attributes", {}).get("value", "")
+                    break
+
+            entry = {
+                "title": title,
+                "size_bytes": size_bytes,
+                "size": size,
+                "date": date,
+                "guid": guid,
+            }
+            page_items.append(entry)
+
+            if args.add_to_sab and guid:
+                nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+                if add_to_sabnzbd(nzb_url, sab_config, title):
+                    if not args.json:
+                        print(f"Added: {title[:70]}")
+                    added_count += 1
+                else:
+                    if not args.json:
+                        print(f"Failed: {title[:70]}")
+            elif not args.json:
+                if not all_items:
+                    print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
+                    print("-" * 105)
+                print(f"{title[:79]:<80} {size:>10} {date:<12}")
+                if args.show_guid:
+                    print(f"  GUID: {guid}")
+
+        all_items.extend(page_items)
+
+        if not args.all:
+            break
+        if offset + len(items) >= total:
+            break
+        offset += args.limit
+        params["offset"] = offset
 
     if args.add_to_sab:
-        print(f"\nAdded {added_count}/{len(items)} NZBs to SABnzbd")
+        if args.json:
+            print(json.dumps({
+                "query": args.query,
+                "total": total,
+                "offset": start_offset,
+                "limit": args.limit,
+                "added": added_count,
+                "items": all_items,
+            }, indent=2))
+        else:
+            print(f"\nAdded {added_count}/{len(all_items)} NZBs to SABnzbd")
     else:
-        print(f"\nShowing {start}-{end} of {total} results")
-        if end < total:
-            next_offset = offset + args.limit
-            print(f"Next page: nzb search \"{args.query}\" --offset {next_offset}")
+        if args.json:
+            print(json.dumps({
+                "query": args.query,
+                "total": total,
+                "offset": start_offset,
+                "limit": args.limit,
+                "items": all_items,
+            }, indent=2))
+        else:
+            start = start_offset + 1 if all_items else 0
+            end = start_offset + len(all_items)
+            print(f"\nShowing {start}-{end} of {total} results")
+            if end < total:
+                next_offset = start_offset + len(all_items)
+                print(f"Next page: nzb search \"{args.query}\" --offset {next_offset}")
 
 def get(args, config):
     import re
@@ -258,30 +380,15 @@ def recent(args, config):
     if not args.no_default_res:
         query = f"{query} {res}".strip()
 
+    offset = args.offset
+    if args.page and args.offset == 0:
+        offset = max(args.page - 1, 0) * args.limit
+
     params = {"t": "search", "q": query, "limit": args.limit}
 
     if args.cat:
         cat = CATEGORIES.get(args.cat, args.cat)
         params["cat"] = cat
-
-    if args.offset:
-        params["offset"] = args.offset
-
-    data = api_request("", params, config)
-
-    # Get total from response
-    response = data.get("channel", {}).get("response", {}).get("@attributes", {})
-    total = int(response.get("total", 0))
-    offset = int(response.get("offset", 0))
-
-    items = data.get("channel", {}).get("item", [])
-
-    if isinstance(items, dict):
-        items = [items]
-
-    if not items:
-        print("No results found")
-        return
 
     # Load SAB config if adding to SABnzbd
     sab_config = None
@@ -291,65 +398,131 @@ def recent(args, config):
             print("Error: SABnzbd config not found at ~/.config/sabnzbd/config.json")
             sys.exit(1)
 
-    # Pagination info
-    start = offset + 1
-    end = offset + len(items)
-
     added_count = 0
-
-    # Group by show/movie name
+    all_items = []
+    total = 0
+    start_offset = offset
     seen = set()
-    if not args.add_to_sab:
-        print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
-        print("-" * 100)
 
-    for item in items:
-        title = item.get("title", "")
-        size = format_size(item.get("enclosure", {}).get("@attributes", {}).get("length", 0))
-        date = item.get("pubDate", "")[:12]
+    if offset:
+        params["offset"] = offset
 
-        # For TV, dedupe by show name
-        if args.cat == "tv":
-            import re
-            match = re.match(r'(.+?)\.(S\d{2})', title)
-            if match:
-                show = match.group(1)
-                if show in seen:
-                    continue
-                seen.add(show)
+    while True:
+        data = api_request("", params, config)
 
-        attrs = item.get("attr", [])
-        if isinstance(attrs, dict):
-            attrs = [attrs]
-        elif attrs is None:
-            attrs = []
-        guid = ""
-        for attr in attrs:
-            if attr.get("@attributes", {}).get("name") == "guid":
-                guid = attr.get("@attributes", {}).get("value", "")
-                break
+        # Get total from response
+        response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+        total = int(response.get("total", total))
+        offset = int(response.get("offset", offset))
 
-        if args.add_to_sab and guid:
-            nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
-            if add_to_sabnzbd(nzb_url, sab_config, title):
-                print(f"Added: {title[:70]}")
-                added_count += 1
+        items = data.get("channel", {}).get("item", [])
+        if isinstance(items, dict):
+            items = [items]
+
+        if not items and not all_items:
+            if args.json:
+                print(json.dumps({
+                    "query": query,
+                    "total": total,
+                    "offset": start_offset,
+                    "limit": args.limit,
+                    "items": [],
+                }, indent=2))
             else:
-                print(f"Failed: {title[:70]}")
-        else:
-            print(f"{title[:74]:<75} {size:>10} {date:<12}")
-            if args.show_guid:
-                print(f"  GUID: {guid}")
+                print("No results found")
+            return
+
+        page_items = []
+        for item in items:
+            title = item.get("title", "")
+            size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
+            size = format_size(size_bytes)
+            date = item.get("pubDate", "")[:12]
+
+            # For TV, dedupe by show name
+            if args.cat == "tv":
+                match = re.match(r'(.+?)\.(S\d{2})', title)
+                if match:
+                    show = match.group(1)
+                    if show in seen:
+                        continue
+                    seen.add(show)
+
+            attrs = item.get("attr", [])
+            if isinstance(attrs, dict):
+                attrs = [attrs]
+            elif attrs is None:
+                attrs = []
+            guid = ""
+            for attr in attrs:
+                if attr.get("@attributes", {}).get("name") == "guid":
+                    guid = attr.get("@attributes", {}).get("value", "")
+                    break
+
+            entry = {
+                "title": title,
+                "size_bytes": size_bytes,
+                "size": size,
+                "date": date,
+                "guid": guid,
+            }
+            page_items.append(entry)
+
+            if args.add_to_sab and guid:
+                nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+                if add_to_sabnzbd(nzb_url, sab_config, title):
+                    if not args.json:
+                        print(f"Added: {title[:70]}")
+                    added_count += 1
+                elif not args.json:
+                    print(f"Failed: {title[:70]}")
+            elif not args.json:
+                if not all_items:
+                    print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
+                    print("-" * 100)
+                print(f"{title[:74]:<75} {size:>10} {date:<12}")
+                if args.show_guid:
+                    print(f"  GUID: {guid}")
+
+        all_items.extend(page_items)
+
+        if not args.all:
+            break
+        if offset + len(items) >= total:
+            break
+        offset += args.limit
+        params["offset"] = offset
 
     if args.add_to_sab:
-        print(f"\nAdded {added_count} NZBs to SABnzbd")
+        if args.json:
+            print(json.dumps({
+                "query": query,
+                "total": total,
+                "offset": start_offset,
+                "limit": args.limit,
+                "added": added_count,
+                "items": all_items,
+            }, indent=2))
+        else:
+            print(f"\nAdded {added_count} NZBs to SABnzbd")
     else:
-        print(f"\nShowing {start}-{end} of {total} results")
-        if end < total:
-            next_offset = offset + args.limit
-            group_arg = f"-g {args.group} " if args.group else ""
-            cat_arg = f"-c {args.cat} " if args.cat else ""
-            print(f"Next page: nzb recent {group_arg}{cat_arg}--offset {next_offset}")
+        if args.json:
+            print(json.dumps({
+                "query": query,
+                "total": total,
+                "offset": start_offset,
+                "limit": args.limit,
+                "items": all_items,
+            }, indent=2))
+        else:
+            start = start_offset + 1 if all_items else 0
+            end = start_offset + len(all_items)
+            print(f"\nShowing {start}-{end} of {total} results")
+            if end < total and not args.all:
+                next_offset = start_offset + len(all_items)
+                group_arg = f"-g {args.group} " if args.group else ""
+                cat_arg = f"-c {args.cat} " if args.cat else ""
+                print(f"Next page: nzb recent {group_arg}{cat_arg}--offset {next_offset}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -375,6 +548,8 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
         """
     )
 
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Search command
@@ -382,6 +557,8 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("-c", "--cat", help="Category (movies, tv, etc)")
     search_p.add_argument("-l", "--limit", type=int, default=50, help="Max results (default: 50)")
+    search_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    search_p.add_argument("--all", action="store_true", help="Fetch all pages")
     search_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     search_p.add_argument("--no-default-res", action="store_true", help="Don't add default resolution to search")
     search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs for downloading")
@@ -398,6 +575,8 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     recent_p.add_argument("-g", "--group", help="Release group (FraMeSToR, HONE, FLUX, etc)")
     recent_p.add_argument("-c", "--cat", help="Category (movies, tv)")
     recent_p.add_argument("-l", "--limit", type=int, default=50, help="Max results (default: 50)")
+    recent_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    recent_p.add_argument("--all", action="store_true", help="Fetch all pages")
     recent_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
     recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs")

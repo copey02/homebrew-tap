@@ -9,17 +9,76 @@ import os
 import sys
 import urllib.request
 import urllib.parse
+import urllib.error
+import time
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
+CONFIG_PATH = Path(os.environ.get(
+    "SABCLI_CONFIG_PATH",
+    os.environ.get("SAB_CONFIG_PATH", str(Path.home() / ".config" / "sabnzbd" / "config.json"))
+))
+VERSION = "1.2.1"
+USER_AGENT = f"SABCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 def load_config():
-    if not CONFIG_PATH.exists():
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error reading config: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif not (os.getenv("SAB_URL") or os.getenv("SAB_API_KEY")):
         print(f"Error: Config not found at {CONFIG_PATH}")
         print("Create it with: url, api_key")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+
+    env_url = os.getenv("SAB_URL")
+    env_key = os.getenv("SAB_API_KEY")
+    if env_url:
+        config["url"] = env_url
+    if env_key:
+        config["api_key"] = env_key
+
+    if not config.get("url") or not config.get("api_key"):
+        print("Error: SABnzbd url/api_key missing (config or SAB_URL/SAB_API_KEY)", file=sys.stderr)
+        sys.exit(1)
+
+    return config
+
+
+def request_json(url, headers=None, data=None, method="GET", retries=3):
+    headers = headers or {}
+    headers.setdefault("User-Agent", USER_AGENT)
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                backoff = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(backoff)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def confirm_action(prompt, assume_yes=False):
+    if assume_yes:
+        return True
+    response = input(f"{prompt} [y/N]: ").strip().lower()
+    return response in ("y", "yes")
 
 def api_request(mode, params, config):
     params["mode"] = mode
@@ -28,8 +87,13 @@ def api_request(mode, params, config):
     url = f"{config['url']}/api?{urllib.parse.urlencode(params)}"
 
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read().decode())
+        return request_json(url)
+    except urllib.error.HTTPError as e:
+        print(f"API Error: {e.code} {e.reason}")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"API Error: {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"API Error: {e}")
         sys.exit(1)
@@ -38,9 +102,55 @@ def format_size(size_str):
     """Convert size string like '131.7 GB' to clean format"""
     return size_str
 
+
+def fetch_slots(mode, section_key, args, config, extra_params=None):
+    params = {"limit": args.limit}
+    if extra_params:
+        params.update(extra_params)
+
+    start = max(args.page - 1, 0) * args.limit
+    if start:
+        params["start"] = start
+
+    all_slots = []
+    total = 0
+    data = {}
+
+    while True:
+        data = api_request(mode, params, config)
+        section = data.get(section_key, {})
+        slots = section.get("slots", [])
+        total = int(section.get("noofslots", total or 0))
+
+        all_slots.extend(slots)
+
+        if not args.all:
+            break
+        if not slots:
+            break
+        if total and len(all_slots) >= total:
+            break
+        if len(slots) < args.limit:
+            break
+
+        start += args.limit
+        params["start"] = start
+
+    section = data.get(section_key, {})
+    section["slots"] = all_slots
+    if total:
+        section["noofslots"] = total
+    data[section_key] = section
+
+    return data, all_slots, total
+
 def status(args, config):
     data = api_request("queue", {}, config)
     q = data.get("queue", {})
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
 
     speed = q.get("speed", "0")
     jobs = q.get("noofslots", 0)
@@ -58,11 +168,17 @@ def status(args, config):
     print(f"ETA:    {eta}")
 
 def queue(args, config):
-    data = api_request("queue", {"limit": args.limit}, config)
-    slots = data.get("queue", {}).get("slots", [])
+    data, slots, total = fetch_slots("queue", "queue", args, config)
 
     if not slots:
-        print("Queue is empty")
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print("Queue is empty")
+        return
+
+    if args.json:
+        print(json.dumps(data, indent=2))
         return
 
     print(f"\n{'#':<3} {'Name':<60} {'Size':>10} {'Progress':>10}")
@@ -84,11 +200,17 @@ def queue(args, config):
     print()
 
 def history(args, config):
-    data = api_request("history", {"limit": args.limit}, config)
-    slots = data.get("history", {}).get("slots", [])
+    data, slots, total = fetch_slots("history", "history", args, config)
 
     if not slots:
-        print("History is empty")
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print("History is empty")
+        return
+
+    if args.json:
+        print(json.dumps(data, indent=2))
         return
 
     print(f"\n{'Name':<65} {'Size':>10} {'Status':>10}")
@@ -104,6 +226,7 @@ def history(args, config):
     print()
 
 def add(args, config):
+    results = []
     for item in args.items:
         # Check if it's a URL
         if item.startswith("http://") or item.startswith("https://"):
@@ -116,19 +239,31 @@ def add(args, config):
             }
             url = f"{config['url']}/api?{urllib.parse.urlencode(params)}"
             try:
-                with urllib.request.urlopen(url, timeout=30) as resp:
-                    result = json.loads(resp.read().decode())
-                    if result.get("status"):
-                        print(f"Added URL: {item[:60]}...")
-                    else:
-                        print(f"Failed: {result.get('error', 'Unknown error')}")
+                result = request_json(url)
+                success = result.get("status", False)
+                if args.json:
+                    results.append({
+                        "item": item,
+                        "success": success,
+                        "error": result.get("error") if not success else None,
+                    })
+                elif success:
+                    print(f"Added URL: {item[:60]}...")
+                else:
+                    print(f"Failed: {result.get('error', 'Unknown error')}")
             except Exception as e:
-                print(f"Error adding URL: {e}")
+                if args.json:
+                    results.append({"item": item, "success": False, "error": str(e)})
+                else:
+                    print(f"Error adding URL: {e}")
         else:
             # Add via file upload
             path = Path(item).expanduser().resolve()
             if not path.exists():
-                print(f"File not found: {item}")
+                if args.json:
+                    results.append({"item": item, "success": False, "error": "File not found"})
+                else:
+                    print(f"File not found: {item}")
                 continue
 
             filename = path.name
@@ -146,18 +281,38 @@ def add(args, config):
                 f'Content-Type: application/x-nzb\r\n\r\n'
             ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
 
-            req = urllib.request.Request(f"{config['url']}/api", data=body)
+            req = urllib.request.Request(
+                f"{config['url']}/api",
+                data=body,
+                headers={"User-Agent": USER_AGENT}
+            )
             req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
 
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     result = json.loads(resp.read().decode())
                     if result.get("status"):
-                        print(f"Added: {filename}")
+                        if args.json:
+                            results.append({"item": filename, "success": True, "error": None})
+                        else:
+                            print(f"Added: {filename}")
                     else:
-                        print(f"Failed: {filename} - {result.get('error', 'Unknown error')}")
+                        if args.json:
+                            results.append({
+                                "item": filename,
+                                "success": False,
+                                "error": result.get("error", "Unknown error"),
+                            })
+                        else:
+                            print(f"Failed: {filename} - {result.get('error', 'Unknown error')}")
             except Exception as e:
-                print(f"Error adding {filename}: {e}")
+                if args.json:
+                    results.append({"item": filename, "success": False, "error": str(e)})
+                else:
+                    print(f"Error adding {filename}: {e}")
+
+    if args.json:
+        print(json.dumps({"results": results}, indent=2))
 
 def delete(args, config):
     """Delete items from queue by index or pattern"""
@@ -165,7 +320,10 @@ def delete(args, config):
     slots = data.get("queue", {}).get("slots", [])
 
     if not slots:
-        print("Queue is empty")
+        if args.json:
+            print(json.dumps({"deleted": []}, indent=2))
+        else:
+            print("Queue is empty")
         return
 
     to_delete = []
@@ -189,28 +347,50 @@ def delete(args, config):
                 print(f"Invalid index: {idx}")
 
     if not to_delete:
-        print("No matching items found")
+        if args.json:
+            print(json.dumps({"deleted": []}, indent=2))
+        else:
+            print("No matching items found")
         return
 
+    if not confirm_action(f"Delete {len(to_delete)} item(s)?", args.yes):
+        print("Aborted")
+        return
+
+    results = []
     for nzo_id, name in to_delete:
         api_request("queue", {"name": "delete", "value": nzo_id}, config)
-        print(f"Deleted: {name[:70]}")
+        if args.json:
+            results.append({"id": nzo_id, "name": name, "success": True})
+        else:
+            print(f"Deleted: {name[:70]}")
 
-    print(f"\nDeleted {len(to_delete)} items")
+    if args.json:
+        print(json.dumps({"deleted": results}, indent=2))
+    else:
+        print(f"\nDeleted {len(to_delete)} items")
 
 def pause(args, config):
     api_request("pause", {}, config)
-    print("Queue paused")
+    if args.json:
+        print(json.dumps({"status": "paused"}, indent=2))
+    else:
+        print("Queue paused")
 
 def resume(args, config):
     api_request("resume", {}, config)
-    print("Queue resumed")
+    if args.json:
+        print(json.dumps({"status": "running"}, indent=2))
+    else:
+        print("Queue resumed")
 
 def speed(args, config):
     if args.limit is not None:
         # Set speed limit (0 = unlimited)
         api_request("config", {"name": "speedlimit", "value": args.limit}, config)
-        if args.limit == 0:
+        if args.json:
+            print(json.dumps({"speed_limit": args.limit}, indent=2))
+        elif args.limit == 0:
             print("Speed limit: unlimited")
         else:
             print(f"Speed limit: {args.limit} KB/s")
@@ -218,7 +398,9 @@ def speed(args, config):
         # Get current speed limit
         data = api_request("queue", {}, config)
         limit = data.get("queue", {}).get("speedlimit", "0")
-        if limit == "0" or limit == 0:
+        if args.json:
+            print(json.dumps({"speed_limit": limit}, indent=2))
+        elif limit == "0" or limit == 0:
             print("Speed limit: unlimited")
         else:
             print(f"Speed limit: {limit} KB/s")
@@ -266,6 +448,8 @@ Examples:
         """
     )
 
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Status command
@@ -274,10 +458,14 @@ Examples:
     # Queue command
     queue_p = subparsers.add_parser("queue", aliases=["q"], help="List queue items")
     queue_p.add_argument("-l", "--limit", type=int, default=20, help="Max items to show")
+    queue_p.add_argument("--page", type=int, default=1, help="Page number")
+    queue_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     # History command
     hist_p = subparsers.add_parser("history", aliases=["h"], help="Show download history")
     hist_p.add_argument("-l", "--limit", type=int, default=20, help="Max items to show")
+    hist_p.add_argument("--page", type=int, default=1, help="Page number")
+    hist_p.add_argument("--all", action="store_true", help="Fetch all pages")
 
     # Add command
     add_p = subparsers.add_parser("add", aliases=["a"], help="Add NZB files or URLs")
@@ -287,6 +475,7 @@ Examples:
     del_p = subparsers.add_parser("delete", aliases=["del", "rm"], help="Delete items from queue")
     del_p.add_argument("indices", nargs="*", type=int, help="Queue indices to delete (1-based)")
     del_p.add_argument("-p", "--pattern", help="Delete by regex pattern match")
+    del_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
 
     # Pause command
     subparsers.add_parser("pause", aliases=["p"], help="Pause queue")

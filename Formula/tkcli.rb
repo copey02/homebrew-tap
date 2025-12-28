@@ -2,8 +2,8 @@ class Tkcli < Formula
   desc "Tracker CLI - Search private trackers (BHD, UNIT3D, FileList, TorrentLeech)"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/tkcli"
-  version "1.3.2"
-  sha256 "d337bca981f2b643810a5c5cd8e2335444dec638d45ce111937f9cd63c381313"
+  version "1.3.3"
+  sha256 "fe867adf0625a4e22d6027397c72a6a2e201aafe264c5267b24d83f38ad60ef6"
   license "MIT"
 
   depends_on "python@3"
