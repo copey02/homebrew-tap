@@ -1,9 +1,9 @@
 class Mediacli < Formula
   desc "Media CLI - Rename and organize movies & TV shows using TMDB (FileBot alternative)"
   homepage "https://github.com/copey02/homebrew-tap"
-  version "1.2.4"
+  version "1.2.5"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/v#{version}/bin/mediacli"
-  sha256 "3e16dfbb2052e4c5276db7e744eb0cbe34b98ee09025a14eb2e5dd82bbb33a57"
+  sha256 "8b3a8d300308d1f540819027e76e5b8c0b1749e60021902f044d14cdf747bf5f"
   license "MIT"
 
   depends_on "python@3"
