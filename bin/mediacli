@@ -5,9 +5,12 @@ A free FileBot alternative
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.request
 import urllib.parse
@@ -15,6 +18,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mediacli" / "config.json"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
+VERSION = "1.2.1"
 
 # Common video extensions
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
@@ -34,15 +38,23 @@ PATTERNS = {
 }
 
 # Default naming patterns
-DEFAULT_TV_PATTERN = "{show} ({year}) - S{season:02d}E{episode:02d} - {title}"
+DEFAULT_TV_PATTERN = "{show} ({year}) - S{season:02d}{episode_range} - {title}"
 DEFAULT_MOVIE_PATTERN = "{title} ({year})"
 
 
 def load_config():
     if not CONFIG_PATH.exists():
         return {}
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+        print("Fix or remove the config file to continue.", file=sys.stderr)
+        return {}
+    except OSError as e:
+        print(f"Error reading config: {e}", file=sys.stderr)
+        return {}
 
 
 def save_config(config):
@@ -55,13 +67,23 @@ def http_request(url, headers=None):
     """Make HTTP request and return JSON response"""
     headers = headers or {}
     req = urllib.request.Request(url, headers=headers)
-    req.add_header("User-Agent", "MediaCLI/1.0")
+    req.add_header("User-Agent", f"MediaCLI/{VERSION}")
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            return None
+        if e.code in {401, 403}:
+            print("Error: unauthorized; check your TMDB API key.", file=sys.stderr)
+            return None
+        if e.code == 429:
+            retry_after = e.headers.get("Retry-After")
+            msg = "Error: rate limited by TMDB."
+            if retry_after:
+                msg += f" Retry after {retry_after} seconds."
+            print(msg, file=sys.stderr)
             return None
         error_body = e.read().decode() if e.fp else str(e)
         print(f"Error: API returned {e.code}", file=sys.stderr)
@@ -148,10 +170,11 @@ def parse_filename(filename):
     info["title"] = clean_title(title_part)
 
     # Extract technical info
-    for key in ["resolution", "codec", "group", "hdr", "bitdepth"]:
+    for key in ["resolution", "codec", "hdr", "bitdepth"]:
         match = PATTERNS[key].search(name)
         if match:
             info[key] = match.group(1)
+    info["group"] = extract_group_from_name(name)
 
     # Source detection - prefer REMUX over BluRay
     if re.search(r"REMUX", name, re.IGNORECASE):
@@ -307,7 +330,9 @@ def cmd_search(args):
 
 def cmd_info(args):
     """Show detected info for files"""
-    files = get_video_files(args.path)
+    if not ensure_ffprobe_available(args.probe):
+        return
+    files = collect_video_files(args.path)
 
     if not files:
         print("No video files found")
@@ -315,6 +340,8 @@ def cmd_info(args):
 
     for f in files:
         info = parse_filename(f.name)
+        if args.probe:
+            apply_probe_info(info, f)
         print(f"\n{f.name}")
         print("-" * 60)
         print(f"  Type: {info['type']}")
@@ -348,7 +375,9 @@ def cmd_info(args):
 def cmd_rename(args):
     """Rename files using TMDB metadata"""
     config = load_config()
-    files = get_video_files(args.path)
+    if not ensure_ffprobe_available(args.probe):
+        return
+    files = collect_video_files(args.path)
 
     if not files:
         print("No video files found")
@@ -358,6 +387,8 @@ def cmd_rename(args):
     groups = {}
     for f in files:
         info = parse_filename(f.name)
+        if args.probe:
+            apply_probe_info(info, f)
         key = (info["type"], info["title"].lower(), info.get("year"))
         if key not in groups:
             groups[key] = {"info": info, "files": []}
@@ -382,6 +413,9 @@ def cmd_rename(args):
                 match = results["results"][0]
 
             show_details = get_tv_details(match["id"])
+            if not show_details:
+                print(f"Error fetching TV details for ID {match['id']}", file=sys.stderr)
+                continue
             show_name = show_details["name"]
             show_year = show_details.get("first_air_date", "")[:4]
 
@@ -416,6 +450,9 @@ def cmd_rename(args):
                 match = results["results"][0]
 
             movie_details = get_movie_details(match["id"])
+            if not movie_details:
+                print(f"Error fetching movie details for ID {match['id']}", file=sys.stderr)
+                continue
             movie_title = movie_details["title"]
             movie_year = movie_details.get("release_date", "")[:4]
 
@@ -429,6 +466,9 @@ def cmd_rename(args):
                 new_name += f.suffix
                 renames.append((f, f.parent / new_name))
 
+    renames = resolve_collisions(renames, args.on_collision)
+    if renames is None:
+        return
     if not renames:
         print("No files to rename")
         return
@@ -462,7 +502,9 @@ def cmd_rename(args):
 def cmd_organize(args):
     """Organize files into TV/Movie folder structure"""
     config = load_config()
-    files = get_video_files(args.path)
+    if not ensure_ffprobe_available(args.probe):
+        return
+    files = collect_video_files(args.path)
 
     if not files:
         print("No video files found")
@@ -475,6 +517,8 @@ def cmd_organize(args):
 
     for f in files:
         info = parse_filename(f.name)
+        if args.probe:
+            apply_probe_info(info, f)
 
         if info["type"] == "tv":
             # Look up show
@@ -482,6 +526,9 @@ def cmd_organize(args):
             if results and results.get("results"):
                 show = results["results"][0]
                 show_details = get_tv_details(show["id"])
+                if not show_details:
+                    print(f"Error fetching TV details for ID {show['id']}", file=sys.stderr)
+                    continue
                 show_name = sanitize_filename(show_details["name"])
                 show_year = show_details.get("first_air_date", "")[:4]
 
@@ -501,6 +548,9 @@ def cmd_organize(args):
             if results and results.get("results"):
                 movie = results["results"][0]
                 movie_details = get_movie_details(movie["id"])
+                if not movie_details:
+                    print(f"Error fetching movie details for ID {movie['id']}", file=sys.stderr)
+                    continue
                 movie_title = sanitize_filename(movie_details["title"])
                 movie_year = movie_details.get("release_date", "")[:4]
 
@@ -516,6 +566,9 @@ def cmd_organize(args):
 
         moves.append((f, dest))
 
+    moves = resolve_collisions(moves, args.on_collision)
+    if moves is None:
+        return
     if not moves:
         print("No files to organize")
         return
@@ -591,6 +644,293 @@ def get_video_files(path):
     return []
 
 
+def ensure_ffprobe_available(enabled):
+    """Ensure ffprobe is available when probing is requested."""
+    if not enabled:
+        return True
+    if shutil.which("ffprobe") is None:
+        print("Error: ffprobe not found; install ffmpeg to use --probe.", file=sys.stderr)
+        return False
+    return True
+
+
+def expand_paths(paths):
+    """Expand user paths and glob patterns into concrete paths."""
+    expanded = []
+    for raw in paths:
+        raw = os.path.expanduser(raw)
+        matches = glob.glob(raw)
+        if matches:
+            expanded.extend(matches)
+        else:
+            expanded.append(raw)
+    return expanded
+
+
+def collect_video_files(paths):
+    """Collect video files from multiple input paths."""
+    files = []
+    seen = set()
+    for raw in expand_paths(paths):
+        for f in get_video_files(raw):
+            if f not in seen:
+                files.append(f)
+                seen.add(f)
+    return sorted(files)
+
+
+def split_extension(path):
+    """Split a path into base name and full extension (including multi-suffix)."""
+    suffixes = path.suffixes
+    if not suffixes:
+        return path.name, ""
+    suffix = "".join(suffixes)
+    base = path.name[: -len(suffix)]
+    return base, suffix
+
+
+def make_unique_path(dest, used):
+    """Generate a unique destination path by adding a numeric suffix."""
+    base, suffix = split_extension(dest)
+    candidate = dest
+    counter = 1
+    while candidate.exists() or candidate in used:
+        candidate = dest.with_name(f"{base} ({counter}){suffix}")
+        counter += 1
+    return candidate
+
+
+def resolve_collisions(ops, policy):
+    """Handle destination collisions for rename/move operations."""
+    ops = [(src, dest) for src, dest in ops if src != dest]
+    if policy == "abort":
+        dest_map = {}
+        for src, dest in ops:
+            dest_map.setdefault(dest, []).append(src)
+        duplicates = {d: s for d, s in dest_map.items() if len(s) > 1}
+        existing = [d for d in dest_map if d.exists()]
+        if duplicates or existing:
+            print("Collision detected; aborting.", file=sys.stderr)
+            if duplicates:
+                print("Duplicate destinations:", file=sys.stderr)
+                for dest, sources in duplicates.items():
+                    print(f"  {dest} ({len(sources)} sources)", file=sys.stderr)
+            if existing:
+                print("Existing destinations:", file=sys.stderr)
+                for dest in existing:
+                    print(f"  {dest}", file=sys.stderr)
+            return None
+        return ops
+    if policy in {"skip", "overwrite"}:
+        result = []
+        seen = set()
+        for src, dest in ops:
+            if dest in seen:
+                print(f"Skipping duplicate destination: {dest}", file=sys.stderr)
+                continue
+            if policy == "skip" and dest.exists():
+                print(f"Skipping existing destination: {dest}", file=sys.stderr)
+                continue
+            if policy == "overwrite" and dest.exists():
+                print(f"Overwriting existing destination: {dest}", file=sys.stderr)
+            seen.add(dest)
+            result.append((src, dest))
+        return result
+    if policy == "unique":
+        result = []
+        used = set()
+        for src, dest in ops:
+            unique_dest = make_unique_path(dest, used)
+            if unique_dest != dest:
+                print(f"Adjusted destination: {dest} -> {unique_dest}", file=sys.stderr)
+            used.add(unique_dest)
+            result.append((src, unique_dest))
+        return result
+    raise ValueError(f"Unknown collision policy: {policy}")
+
+
+def is_ignored_group_token(token):
+    """Return True if token looks like codec/quality metadata, not a group."""
+    for key in ["codec", "resolution", "source", "hdr", "bitdepth", "audio"]:
+        if PATTERNS[key].fullmatch(token):
+            return True
+    return False
+
+
+def extract_group_from_name(name):
+    """Extract release group from filename, ignoring codec suffixes."""
+    base = name
+    while True:
+        match = re.search(r"-([A-Za-z0-9]+)$", base)
+        if not match:
+            return None
+        token = match.group(1)
+        if is_ignored_group_token(token):
+            base = base[:match.start()]
+            continue
+        return token
+
+
+def normalize_channels(channels, channel_layout):
+    """Normalize audio channel layout to a display string."""
+    if channel_layout:
+        match = re.match(r"^(\\d\\.\\d)", channel_layout)
+        if match:
+            return match.group(1)
+    if channels is None:
+        return None
+    channel_map = {1: "1.0", 2: "2.0", 6: "5.1", 7: "6.1", 8: "7.1"}
+    return channel_map.get(channels, f"{channels}.0")
+
+
+def map_video_codec(codec_name):
+    """Normalize video codec names from ffprobe."""
+    if not codec_name:
+        return None
+    name = codec_name.lower()
+    if name in {"h264", "avc1"}:
+        return "H.264"
+    if name in {"hevc", "h265"}:
+        return "HEVC"
+    if name == "av1":
+        return "AV1"
+    if name in {"mpeg2video", "mpeg2"}:
+        return "MPEG-2"
+    if name == "vp9":
+        return "VP9"
+    return codec_name.upper()
+
+
+def map_audio_codec(codec_name, profile):
+    """Normalize audio codec names from ffprobe."""
+    if not codec_name:
+        return None
+    name = codec_name.lower()
+    profile = (profile or "").lower()
+    if name == "truehd":
+        return "TrueHD"
+    if name == "eac3":
+        return "EAC3"
+    if name == "ac3":
+        return "DD"
+    if name == "aac":
+        return "AAC"
+    if name == "flac":
+        return "FLAC"
+    if name == "opus":
+        return "Opus"
+    if name.startswith("pcm"):
+        return "PCM"
+    if name == "dts":
+        if "dts-hd ma" in profile:
+            return "DTS-HD MA"
+        if "dts-hd" in profile:
+            return "DTS-HD"
+        return "DTS"
+    return codec_name.upper()
+
+
+def detect_hdr(color_transfer, color_primaries):
+    """Detect HDR info from ffprobe color metadata."""
+    transfer = (color_transfer or "").lower()
+    primaries = (color_primaries or "").lower()
+    if transfer == "smpte2084":
+        return "HDR10"
+    if transfer == "arib-std-b67":
+        return "HDR"
+    if primaries == "bt2020":
+        return "HDR"
+    return None
+
+
+def detect_bitdepth(pix_fmt):
+    """Detect bit depth from ffprobe pixel format."""
+    if not pix_fmt:
+        return None
+    match = re.search(r"p(\\d+)", pix_fmt)
+    if not match:
+        return None
+    depth = match.group(1)
+    if depth.isdigit():
+        return f"{depth}bit"
+    return None
+
+
+def infer_resolution(height):
+    """Infer resolution label from video height."""
+    if height is None:
+        return None
+    if height >= 2100:
+        return "2160p"
+    if height >= 1000:
+        return "1080p"
+    if height >= 700:
+        return "720p"
+    if height >= 400:
+        return "480p"
+    return f"{height}p"
+
+
+def probe_media_info(path):
+    """Probe actual media streams with ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError as e:
+        print(f"Error running ffprobe: {e}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        message = result.stderr.strip() or "ffprobe failed"
+        print(f"Error: {message}", file=sys.stderr)
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("Error: failed to parse ffprobe output.", file=sys.stderr)
+        return None
+    streams = payload.get("streams", [])
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    info = {}
+    if video_stream:
+        info["resolution"] = infer_resolution(video_stream.get("height"))
+        info["codec"] = map_video_codec(video_stream.get("codec_name"))
+        info["hdr"] = detect_hdr(
+            video_stream.get("color_transfer"),
+            video_stream.get("color_primaries"),
+        )
+        info["bitdepth"] = detect_bitdepth(video_stream.get("pix_fmt"))
+    if audio_stream:
+        info["audio"] = map_audio_codec(
+            audio_stream.get("codec_name"),
+            audio_stream.get("profile"),
+        )
+        info["audio_channels"] = normalize_channels(
+            audio_stream.get("channels"),
+            audio_stream.get("channel_layout"),
+        )
+    return info
+
+
+def apply_probe_info(info, path):
+    """Merge ffprobe-derived info into parsed filename info."""
+    probe = probe_media_info(path)
+    if not probe:
+        print(f"Warning: ffprobe failed for {path}; using filename data.", file=sys.stderr)
+        return
+    for key, value in probe.items():
+        if value:
+            info[key] = value
+
+
 def sanitize_filename(name):
     """Remove invalid filename characters"""
     # Replace invalid chars with space
@@ -651,9 +991,19 @@ def format_tv_name(show, year, season, episode, episode_end, title, info, patter
 
     # Format episode string
     if episode_end:
-        ep_str = f"E{episode:02d}-E{episode_end:02d}"
+        episode_range = f"E{episode:02d}-E{episode_end:02d}"
     else:
-        ep_str = f"E{episode:02d}"
+        episode_range = f"E{episode:02d}"
+
+    if episode_end and "{episode_range}" not in pattern:
+        if "E{episode:02d}" in pattern:
+            pattern = pattern.replace("E{episode:02d}", "{episode_range}")
+        elif "E{episode}" in pattern:
+            pattern = pattern.replace("E{episode}", "{episode_range}")
+        elif "{episode:02d}" in pattern:
+            pattern = pattern.replace("{episode:02d}", "{episode_range}")
+        elif "{episode}" in pattern:
+            pattern = pattern.replace("{episode}", "{episode_range}")
 
     # Apply pattern
     name = pattern.format(
@@ -661,12 +1011,9 @@ def format_tv_name(show, year, season, episode, episode_end, title, info, patter
         year=year,
         season=season,
         episode=episode,
+        episode_range=episode_range,
         title=sanitize_filename(title),
     )
-
-    # Handle multi-episode
-    if episode_end:
-        name = re.sub(r"E\d{2}", ep_str, name)
 
     return f"{name} {tech_suffix}{group_suffix}".strip()
 
@@ -762,6 +1109,7 @@ def main():
 Examples:
   media search "Breaking Bad"          Search TMDB
   media info ~/Downloads/*.mkv         Show detected info
+  media info ~/Downloads/*.mkv --probe Use ffprobe for stream metadata
   media rename ~/Downloads/ --dry-run  Preview renames
   media rename ~/Downloads/ -y         Rename without confirm
   media organize ~/Downloads/          Move to TV/Movie folders
@@ -769,7 +1117,7 @@ Examples:
 Config: ~/.config/mediacli/config.json
   {
     "tmdb_api_key": "your-api-key",
-    "tv_pattern": "{show} ({year}) - S{season:02d}E{episode:02d} - {title}",
+    "tv_pattern": "{show} ({year}) - S{season:02d}{episode_range} - {title}",
     "movie_pattern": "{title} ({year})",
     "tv_folder": "~/TV Shows",
     "movie_folder": "~/Movies"
@@ -790,23 +1138,38 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
 
     # info
     p_info = subparsers.add_parser("info", help="Show detected info for files")
-    p_info.add_argument("path", help="File or directory to analyze")
+    p_info.add_argument("path", nargs="+", help="Files or directories to analyze")
+    p_info.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
 
     # rename
     p_rename = subparsers.add_parser("rename", help="Rename files using TMDB")
-    p_rename.add_argument("path", help="File or directory to rename")
+    p_rename.add_argument("path", nargs="+", help="Files or directories to rename")
     p_rename.add_argument("--dry-run", "-n", action="store_true", help="Preview only")
     p_rename.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     p_rename.add_argument("--pattern", "-p", help="Custom naming pattern")
     p_rename.add_argument("--interactive", "-i", action="store_true", help="Select matches interactively")
+    p_rename.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
+    p_rename.add_argument(
+        "--on-collision",
+        choices=["abort", "skip", "overwrite", "unique"],
+        default="abort",
+        help="Collision handling for destination files (default: abort)"
+    )
 
     # organize
     p_org = subparsers.add_parser("organize", help="Organize into folders")
-    p_org.add_argument("path", help="File or directory to organize")
+    p_org.add_argument("path", nargs="+", help="Files or directories to organize")
     p_org.add_argument("--dry-run", "-n", action="store_true", help="Preview only")
     p_org.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     p_org.add_argument("--tv-folder", help="TV shows destination")
     p_org.add_argument("--movie-folder", help="Movies destination")
+    p_org.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
+    p_org.add_argument(
+        "--on-collision",
+        choices=["abort", "skip", "overwrite", "unique"],
+        default="abort",
+        help="Collision handling for destination files (default: abort)"
+    )
 
     # config
     p_config = subparsers.add_parser("config", help="Show/set configuration")
