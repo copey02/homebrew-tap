@@ -6,10 +6,22 @@ Personal Homebrew formulas for media automation tools.
 
 ```bash
 brew tap copey02/tap
-brew install nzbcli sabcli tkcli tmcli tidarrcli foodcli
+brew install mediacli nzbcli sabcli tkcli trtcli sonarrcli tidarrcli foodcli
 ```
 
 ## Formulas
+
+### mediacli (media)
+
+MediaCLI - Rename and organize movies & TV shows using TMDB metadata.
+
+```bash
+media search "Severance"                    # Search TMDB
+media info ~/Downloads/*.mkv --probe        # Show detected info with ffprobe
+media rename ~/Downloads --dry-run          # Preview renames
+media rename ~/Downloads --tmdb-id 1399 --tmdb-type tv
+media organize ~/Downloads --dry-run        # Preview folder moves
+```
 
 ### foodcli (food)
 
@@ -50,22 +62,22 @@ tk search "Movie Name"          # Search all trackers (1080p default)
 tk search "Movie" -t bhd        # Search Beyond-HD only
 tk search "Movie" -r 2160p      # Search for 4K
 tk get <url>                    # Download torrent file
-tk get <url> --add-to-tm        # Download and add to Transmission
+tk get <url> -T                 # Download and add to torrent client
 tk recent                       # Recent uploads
 ```
 
-### tmcli (tm)
+### trtcli (trt)
 
-Transmission CLI - Control Transmission BitTorrent client.
+Torrent CLI - Control Transmission or qBittorrent.
 
 ```bash
-tm list                         # List all torrents
-tm list -f downloading          # Filter by status
-tm info 1                       # Detailed torrent info
-tm add magnet:?...              # Add magnet link
-tm add file.torrent             # Add torrent file
-tm remove 1-5                   # Remove torrents
-tm watch                        # Monitor until complete
+trt list                        # List all torrents
+trt list -d                     # Show downloading only
+trt info 1                      # Detailed torrent info
+trt add magnet:?...             # Add magnet link
+trt add file.torrent            # Add torrent file
+trt remove 1-5                  # Remove torrents
+trt watch                       # Monitor until complete
 ```
 
 ### nzbcli (nzb)
@@ -91,9 +103,32 @@ sab watch           # Monitor until complete
 sab pause / resume  # Control queue
 ```
 
+### sonarrcli (snr)
+
+Sonarr CLI - Manage TV series and downloads via Sonarr API.
+
+```bash
+snr series                     # List series
+snr search "Slow Horses"       # Search for series
+snr add 362496 --search         # Add by TVDB ID
+snr queue                       # Show download queue
+snr wanted --all                # Missing episodes
+```
+
 ## Configuration
 
 After installation, create config files:
+
+**~/.config/mediacli/config.json**
+```json
+{
+  "tmdb_api_key": "YOUR_TMDB_API_KEY",
+  "tv_pattern": "{show} ({year}) - S{season:02d}{episode_range} - {title}",
+  "movie_pattern": "{title} ({year})",
+  "tv_folder": "~/TV Shows",
+  "movie_folder": "~/Movies"
+}
+```
 
 **~/.config/tidarr/config.json**
 ```json
@@ -115,7 +150,7 @@ Note: password is only needed if Tidarr auth is enabled.
 }
 ```
 
-**~/.config/transmission/config.json** (for tmcli)
+**~/.config/torrent/config.json** (for trtcli)
 ```json
 {
   "url": "http://localhost:9091/transmission/rpc",
@@ -149,3 +184,16 @@ Note: password is only needed if Tidarr auth is enabled.
 }
 ```
 Get your free API key at: https://fdc.nal.usda.gov/api-key-signup.html
+
+**~/.config/sonarr/config.json**
+```json
+{
+  "default_instance": "main",
+  "instances": {
+    "main": {
+      "url": "http://localhost:8989",
+      "api_key": "YOUR_SONARR_API_KEY"
+    }
+  }
+}
+```
