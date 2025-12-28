@@ -18,7 +18,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mediacli" / "config.json"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 # Common video extensions
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
@@ -383,48 +383,39 @@ def cmd_rename(args):
         print("No video files found")
         return
 
-    # Group files by detected show/movie
-    groups = {}
+    file_infos = []
     for f in files:
         info = parse_filename(f.name)
         if args.probe:
             apply_probe_info(info, f)
-        key = (info["type"], info["title"].lower(), info.get("year"))
-        if key not in groups:
-            groups[key] = {"info": info, "files": []}
-        groups[key]["files"].append((f, info))
+        file_infos.append((f, info))
 
     renames = []
 
-    for key, group in groups.items():
-        media_type, title, year = key
-
-        # Look up on TMDB
-        if media_type == "tv":
-            results = search_tv(group["info"]["title"], year)
-            if not results or not results.get("results"):
-                print(f"No TMDB match for TV: {group['info']['title']}")
-                continue
-
-            # Use first result or let user select
-            if args.interactive and len(results["results"]) > 1:
-                match = select_result(results["results"][:5], "tv")
+    if args.tmdb_id:
+        type_set = {info.get("type") for _, info in file_infos if info.get("type")}
+        media_type = args.tmdb_type
+        if not media_type:
+            if len(type_set) == 1:
+                media_type = type_set.pop()
             else:
-                match = results["results"][0]
+                print("Error: multiple media types detected; use --tmdb-type tv|movie.", file=sys.stderr)
+                return
 
-            show_details = get_tv_details(match["id"])
+        if media_type == "tv":
+            show_details = get_tv_details(args.tmdb_id)
             if not show_details:
-                print(f"Error fetching TV details for ID {match['id']}", file=sys.stderr)
-                continue
+                print(f"Error fetching TV details for ID {args.tmdb_id}", file=sys.stderr)
+                return
             show_name = show_details["name"]
             show_year = show_details.get("first_air_date", "")[:4]
 
-            for f, info in group["files"]:
-                # Get episode title
-                ep_details = get_tv_episode(match["id"], info["season"], info["episode"])
+            for f, info in file_infos:
+                if info.get("season") is None or info.get("episode") is None:
+                    print(f"Skipping (missing season/episode): {f.name}", file=sys.stderr)
+                    continue
+                ep_details = get_tv_episode(args.tmdb_id, info["season"], info["episode"])
                 ep_title = ep_details["name"] if ep_details else f"Episode {info['episode']}"
-
-                # Build new name
                 new_name = format_tv_name(
                     show=show_name,
                     year=show_year,
@@ -437,26 +428,15 @@ def cmd_rename(args):
                 )
                 new_name += f.suffix
                 renames.append((f, f.parent / new_name))
-
-        else:  # movie
-            results = search_movie(group["info"]["title"], year)
-            if not results or not results.get("results"):
-                print(f"No TMDB match for movie: {group['info']['title']}")
-                continue
-
-            if args.interactive and len(results["results"]) > 1:
-                match = select_result(results["results"][:5], "movie")
-            else:
-                match = results["results"][0]
-
-            movie_details = get_movie_details(match["id"])
+        elif media_type == "movie":
+            movie_details = get_movie_details(args.tmdb_id)
             if not movie_details:
-                print(f"Error fetching movie details for ID {match['id']}", file=sys.stderr)
-                continue
+                print(f"Error fetching movie details for ID {args.tmdb_id}", file=sys.stderr)
+                return
             movie_title = movie_details["title"]
             movie_year = movie_details.get("release_date", "")[:4]
 
-            for f, info in group["files"]:
+            for f, info in file_infos:
                 new_name = format_movie_name(
                     title=movie_title,
                     year=movie_year,
@@ -465,6 +445,87 @@ def cmd_rename(args):
                 )
                 new_name += f.suffix
                 renames.append((f, f.parent / new_name))
+        else:
+            print("Error: --tmdb-type must be tv or movie.", file=sys.stderr)
+            return
+    else:
+        # Group files by detected show/movie
+        groups = {}
+        for f, info in file_infos:
+            key = (info["type"], info["title"].lower(), info.get("year"))
+            if key not in groups:
+                groups[key] = {"info": info, "files": []}
+            groups[key]["files"].append((f, info))
+
+        for key, group in groups.items():
+            media_type, title, year = key
+
+            # Look up on TMDB
+            if media_type == "tv":
+                results = search_tv(group["info"]["title"], year)
+                if not results or not results.get("results"):
+                    print(f"No TMDB match for TV: {group['info']['title']}")
+                    continue
+
+                # Use first result or let user select
+                if args.interactive and len(results["results"]) > 1:
+                    match = select_result(results["results"][:5], "tv")
+                else:
+                    match = results["results"][0]
+
+                show_details = get_tv_details(match["id"])
+                if not show_details:
+                    print(f"Error fetching TV details for ID {match['id']}", file=sys.stderr)
+                    continue
+                show_name = show_details["name"]
+                show_year = show_details.get("first_air_date", "")[:4]
+
+                for f, info in group["files"]:
+                    # Get episode title
+                    ep_details = get_tv_episode(match["id"], info["season"], info["episode"])
+                    ep_title = ep_details["name"] if ep_details else f"Episode {info['episode']}"
+
+                    # Build new name
+                    new_name = format_tv_name(
+                        show=show_name,
+                        year=show_year,
+                        season=info["season"],
+                        episode=info["episode"],
+                        episode_end=info.get("episode_end"),
+                        title=ep_title,
+                        info=info,
+                        pattern=args.pattern or config.get("tv_pattern", DEFAULT_TV_PATTERN)
+                    )
+                    new_name += f.suffix
+                    renames.append((f, f.parent / new_name))
+
+            else:  # movie
+                results = search_movie(group["info"]["title"], year)
+                if not results or not results.get("results"):
+                    print(f"No TMDB match for movie: {group['info']['title']}")
+                    continue
+
+                if args.interactive and len(results["results"]) > 1:
+                    match = select_result(results["results"][:5], "movie")
+                else:
+                    match = results["results"][0]
+
+                movie_details = get_movie_details(match["id"])
+                if not movie_details:
+                    print(f"Error fetching movie details for ID {match['id']}", file=sys.stderr)
+                    continue
+                movie_title = movie_details["title"]
+                movie_year = movie_details.get("release_date", "")[:4]
+
+                for f, info in group["files"]:
+                    new_name = format_movie_name(
+                        title=movie_title,
+                        year=movie_year,
+                        info=info,
+                        pattern=args.pattern or config.get("movie_pattern", DEFAULT_MOVIE_PATTERN)
+                    )
+                    new_name += f.suffix
+                    renames.append((f, f.parent / new_name))
 
     renames = resolve_collisions(renames, args.on_collision)
     if renames is None:
@@ -515,56 +576,101 @@ def cmd_organize(args):
 
     moves = []
 
+    file_infos = []
     for f in files:
         info = parse_filename(f.name)
         if args.probe:
             apply_probe_info(info, f)
+        file_infos.append((f, info))
 
-        if info["type"] == "tv":
-            # Look up show
-            results = search_tv(info["title"], info.get("year"))
-            if results and results.get("results"):
-                show = results["results"][0]
-                show_details = get_tv_details(show["id"])
-                if not show_details:
-                    print(f"Error fetching TV details for ID {show['id']}", file=sys.stderr)
+    if args.tmdb_id:
+        type_set = {info.get("type") for _, info in file_infos if info.get("type")}
+        media_type = args.tmdb_type
+        if not media_type:
+            if len(type_set) == 1:
+                media_type = type_set.pop()
+            else:
+                print("Error: multiple media types detected; use --tmdb-type tv|movie.", file=sys.stderr)
+                return
+
+        if media_type == "tv":
+            show_details = get_tv_details(args.tmdb_id)
+            if not show_details:
+                print(f"Error fetching TV details for ID {args.tmdb_id}", file=sys.stderr)
+                return
+            show_name = sanitize_filename(show_details["name"])
+            show_year = show_details.get("first_air_date", "")[:4]
+            folder_name = f"{show_name} ({show_year})" if show_year else show_name
+
+            for f, info in file_infos:
+                if info.get("season") is None:
+                    print(f"Skipping (missing season): {f.name}", file=sys.stderr)
                     continue
-                show_name = sanitize_filename(show_details["name"])
-                show_year = show_details.get("first_air_date", "")[:4]
-
-                if show_year:
-                    folder_name = f"{show_name} ({show_year})"
-                else:
-                    folder_name = show_name
-
                 season_folder = f"Season {info['season']:02d}"
                 dest = tv_folder / folder_name / season_folder / f.name
-            else:
-                print(f"No match for: {f.name}")
-                continue
-        else:
-            # Look up movie
-            results = search_movie(info["title"], info.get("year"))
-            if results and results.get("results"):
-                movie = results["results"][0]
-                movie_details = get_movie_details(movie["id"])
-                if not movie_details:
-                    print(f"Error fetching movie details for ID {movie['id']}", file=sys.stderr)
-                    continue
-                movie_title = sanitize_filename(movie_details["title"])
-                movie_year = movie_details.get("release_date", "")[:4]
+                moves.append((f, dest))
+        elif media_type == "movie":
+            movie_details = get_movie_details(args.tmdb_id)
+            if not movie_details:
+                print(f"Error fetching movie details for ID {args.tmdb_id}", file=sys.stderr)
+                return
+            movie_title = sanitize_filename(movie_details["title"])
+            movie_year = movie_details.get("release_date", "")[:4]
+            folder_name = f"{movie_title} ({movie_year})" if movie_year else movie_title
 
-                if movie_year:
-                    folder_name = f"{movie_title} ({movie_year})"
-                else:
-                    folder_name = movie_title
-
+            for f, info in file_infos:
                 dest = movie_folder / folder_name / f.name
-            else:
-                print(f"No match for: {f.name}")
-                continue
+                moves.append((f, dest))
+        else:
+            print("Error: --tmdb-type must be tv or movie.", file=sys.stderr)
+            return
+    else:
+        for f, info in file_infos:
+            if info["type"] == "tv":
+                # Look up show
+                results = search_tv(info["title"], info.get("year"))
+                if results and results.get("results"):
+                    show = results["results"][0]
+                    show_details = get_tv_details(show["id"])
+                    if not show_details:
+                        print(f"Error fetching TV details for ID {show['id']}", file=sys.stderr)
+                        continue
+                    show_name = sanitize_filename(show_details["name"])
+                    show_year = show_details.get("first_air_date", "")[:4]
 
-        moves.append((f, dest))
+                    if show_year:
+                        folder_name = f"{show_name} ({show_year})"
+                    else:
+                        folder_name = show_name
+
+                    season_folder = f"Season {info['season']:02d}"
+                    dest = tv_folder / folder_name / season_folder / f.name
+                else:
+                    print(f"No match for: {f.name}")
+                    continue
+            else:
+                # Look up movie
+                results = search_movie(info["title"], info.get("year"))
+                if results and results.get("results"):
+                    movie = results["results"][0]
+                    movie_details = get_movie_details(movie["id"])
+                    if not movie_details:
+                        print(f"Error fetching movie details for ID {movie['id']}", file=sys.stderr)
+                        continue
+                    movie_title = sanitize_filename(movie_details["title"])
+                    movie_year = movie_details.get("release_date", "")[:4]
+
+                    if movie_year:
+                        folder_name = f"{movie_title} ({movie_year})"
+                    else:
+                        folder_name = movie_title
+
+                    dest = movie_folder / folder_name / f.name
+                else:
+                    print(f"No match for: {f.name}")
+                    continue
+
+            moves.append((f, dest))
 
     moves = resolve_collisions(moves, args.on_collision)
     if moves is None:
@@ -1113,8 +1219,10 @@ Examples:
   media info ~/Downloads/*.mkv --probe Use ffprobe for stream metadata
   media rename ~/Downloads/ -r         Include subdirectories
   media rename ~/Downloads/ --dry-run  Preview renames
+  media rename ~/Downloads/ --tmdb-id 1399 --tmdb-type tv
   media rename ~/Downloads/ -y         Rename without confirm
   media organize ~/Downloads/          Move to TV/Movie folders
+  media organize ~/Downloads/ --tmdb-id 550 --tmdb-type movie
 
 Config: ~/.config/mediacli/config.json
   {
@@ -1153,6 +1261,8 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_rename.add_argument("--interactive", "-i", action="store_true", help="Select matches interactively")
     p_rename.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
     p_rename.add_argument("--recursive", "-r", action="store_true", help="Search subdirectories")
+    p_rename.add_argument("--tmdb-id", type=int, help="Use a specific TMDB ID for all files")
+    p_rename.add_argument("--tmdb-type", choices=["tv", "movie"], help="TMDB ID media type")
     p_rename.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],
@@ -1169,6 +1279,8 @@ Get free TMDB API key at: https://www.themoviedb.org/settings/api
     p_org.add_argument("--movie-folder", help="Movies destination")
     p_org.add_argument("--probe", action="store_true", help="Use ffprobe for stream metadata")
     p_org.add_argument("--recursive", "-r", action="store_true", help="Search subdirectories")
+    p_org.add_argument("--tmdb-id", type=int, help="Use a specific TMDB ID for all files")
+    p_org.add_argument("--tmdb-type", choices=["tv", "movie"], help="TMDB ID media type")
     p_org.add_argument(
         "--on-collision",
         choices=["abort", "skip", "overwrite", "unique"],
