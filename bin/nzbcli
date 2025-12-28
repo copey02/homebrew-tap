@@ -6,6 +6,7 @@ NZBgeek CLI - Search and download NZBs from NZBgeek
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.parse
@@ -47,6 +48,12 @@ def api_request(endpoint, params, config):
 def format_size(bytes_val):
     gb = int(bytes_val) / 1024 / 1024 / 1024
     return f"{gb:.1f} GB"
+
+def sanitize_filename(name, default="download"):
+    base = Path(str(name)).name
+    base = re.sub(r'[<>:"/\\|?*]', " ", base)
+    base = re.sub(r"\s+", " ", base).strip().strip(". ")
+    return base if base else default
 
 def load_sab_config():
     if not SAB_CONFIG_PATH.exists():
@@ -133,6 +140,10 @@ def search(args, config):
 
         # Get GUID for easy copying
         attrs = item.get("attr", [])
+        if isinstance(attrs, dict):
+            attrs = [attrs]
+        elif attrs is None:
+            attrs = []
         guid = ""
         for attr in attrs:
             if attr.get("@attributes", {}).get("name") == "guid":
@@ -225,7 +236,9 @@ def get(args, config):
             except Exception:
                 pass
 
-            filename = f"{title}.nzb"
+            filename = sanitize_filename(title)
+            if not filename.lower().endswith(".nzb"):
+                filename = f"{filename}.nzb"
             output_path = output_dir / filename
             shutil.move(tmp_path, output_path)
 
@@ -306,6 +319,10 @@ def recent(args, config):
                 seen.add(show)
 
         attrs = item.get("attr", [])
+        if isinstance(attrs, dict):
+            attrs = [attrs]
+        elif attrs is None:
+            attrs = []
         guid = ""
         for attr in attrs:
             if attr.get("@attributes", {}).get("name") == "guid":

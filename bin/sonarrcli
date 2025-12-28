@@ -219,7 +219,7 @@ def cmd_search(args, config):
         print(f"{i:<3} {tvdb:<8} {title:<45} {year:<6} {status:<12}{added}")
 
     print(f"\nShowing {min(len(results), args.limit)} of {len(results)} results")
-    print("Use 'snr add <number>' to add a series from this search")
+    print("Use 'snr add <tvdb_id>' to add a series")
 
 
 def cmd_add(args, config):

@@ -6,6 +6,7 @@ Supports: Beyond-HD, Hawke/FNP (UNIT3D), FileList, TorrentLeech
 
 import argparse
 import json
+import re
 import sys
 import urllib.request
 import urllib.parse
@@ -271,6 +272,12 @@ def format_size(bytes_val):
         return f"{mb:.0f} MB"
     except (ValueError, TypeError):
         return "? GB"
+
+def sanitize_filename(name, default="download"):
+    base = Path(str(name)).name
+    base = re.sub(r'[<>:"/\\|?*]', " ", base)
+    base = re.sub(r"\s+", " ", base).strip().strip(". ")
+    return base if base else default
 
 
 def bhd_search(query, config, limit=50, resolution=None):
@@ -710,8 +717,9 @@ def get(args, config):
     # Determine tracker from URL for auth headers
     headers = {}
     for tracker_name, tracker in config.get("trackers", {}).items():
-        if tracker["url"] in url:
-            if tracker.get("type") != "bhd":
+        tracker_url = tracker.get("url", "")
+        if tracker_url and tracker_url in url:
+            if tracker.get("type") == "unit3d" and tracker.get("api_key"):
                 headers["Authorization"] = f"Bearer {tracker['api_key']}"
             break
 
@@ -731,6 +739,9 @@ def get(args, config):
 
             if not filename:
                 filename = "download.torrent"
+            filename = sanitize_filename(filename)
+            if not filename.lower().endswith(".torrent"):
+                filename = f"{filename}.torrent"
 
             output_path = output_dir / filename
             with open(output_path, "wb") as f:
