@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""
+MediaCLI - Rename and organize movies & TV shows using TMDB metadata
+A free FileBot alternative
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "mediacli" / "config.json"
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+
+# Common video extensions
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
+
+# Regex patterns for parsing filenames
+PATTERNS = {
+    "tv_sxxexx": re.compile(r"[.\s_-]S(\d{1,2})E(\d{1,2})(?:[-E]E?(\d{1,2}))?", re.IGNORECASE),
+    "tv_xofx": re.compile(r"[.\s_-](\d{1,2})of(\d{1,2})[.\s_-]", re.IGNORECASE),
+    "year": re.compile(r"[\.\s\(\[]?((?:19|20)\d{2})[\.\s\)\]]?"),
+    "resolution": re.compile(r"(2160p|1080p|720p|480p|4K|UHD)", re.IGNORECASE),
+    "codec": re.compile(r"(H\.?265|HEVC|x265|H\.?264|AVC|x264|AV1|VP9|MPEG-?2)", re.IGNORECASE),
+    "audio": re.compile(r"(DTS-HD[.\s]?MA|TrueHD[.\s]?Atmos|TrueHD|Atmos|DTS-X|DTS|DD\+|EAC3|E-AC-3|AAC|FLAC|Opus|LPCM|PCM|DD)[.\s]?(\d\.\d)?", re.IGNORECASE),
+    "source": re.compile(r"(REMUX|BluRay|Blu-Ray|BDRip|BRRip|WEB-DL|WEBDL|WEBRip|WEB|HDTV|DVDRip|DVD)", re.IGNORECASE),
+    "group": re.compile(r"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$"),
+    "hdr": re.compile(r"(HDR10\+|HDR10|HDR|DV|DoVi|Dolby Vision)", re.IGNORECASE),
+    "bitdepth": re.compile(r"(10[.\s-]?bit|8[.\s-]?bit)", re.IGNORECASE),
+}
+
+# Default naming patterns
+DEFAULT_TV_PATTERN = "{show} ({year}) - S{season:02d}E{episode:02d} - {title}"
+DEFAULT_MOVIE_PATTERN = "{title} ({year})"
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def save_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def http_request(url, headers=None):
+    """Make HTTP request and return JSON response"""
+    headers = headers or {}
+    req = urllib.request.Request(url, headers=headers)
+    req.add_header("User-Agent", "MediaCLI/1.0")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        error_body = e.read().decode() if e.fp else str(e)
+        print(f"Error: API returned {e.code}", file=sys.stderr)
+        print(error_body[:500], file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
+
+
+def tmdb_request(endpoint, params=None):
+    """Make TMDB API request"""
+    config = load_config()
+    api_key = config.get("tmdb_api_key")
+    if not api_key:
+        print("Error: TMDB API key required", file=sys.stderr)
+        print("Get free key at: https://www.themoviedb.org/settings/api", file=sys.stderr)
+        print(f"Add to: {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    params = params or {}
+    params["api_key"] = api_key
+    query = urllib.parse.urlencode(params)
+    url = f"{TMDB_API_BASE}{endpoint}?{query}"
+    return http_request(url)
+
+
+# =============================================================================
+# Filename Parsing
+# =============================================================================
+
+def parse_filename(filename):
+    """Extract metadata from filename"""
+    info = {
+        "original": filename,
+        "type": None,  # "tv" or "movie"
+        "title": None,
+        "year": None,
+        "season": None,
+        "episode": None,
+        "episode_end": None,
+        "resolution": None,
+        "codec": None,
+        "audio": None,
+        "audio_channels": None,
+        "source": None,
+        "group": None,
+        "hdr": None,
+        "bitdepth": None,
+    }
+
+    name = Path(filename).stem
+
+    # Check for TV pattern first
+    tv_match = PATTERNS["tv_sxxexx"].search(name)
+    if tv_match:
+        info["type"] = "tv"
+        info["season"] = int(tv_match.group(1))
+        info["episode"] = int(tv_match.group(2))
+        if tv_match.group(3):
+            info["episode_end"] = int(tv_match.group(3))
+        # Title is everything before the season/episode
+        title_part = name[:tv_match.start()]
+    else:
+        # Check for "1of6" format
+        xofx_match = PATTERNS["tv_xofx"].search(name)
+        if xofx_match:
+            info["type"] = "tv"
+            info["episode"] = int(xofx_match.group(1))
+            info["season"] = 1
+            title_part = name[:xofx_match.start()]
+        else:
+            info["type"] = "movie"
+            title_part = name
+
+    # Extract year
+    year_match = PATTERNS["year"].search(title_part)
+    if year_match:
+        info["year"] = int(year_match.group(1))
+        # Remove year from title
+        title_part = title_part[:year_match.start()]
+
+    # Clean title
+    info["title"] = clean_title(title_part)
+
+    # Extract technical info
+    for key in ["resolution", "codec", "group", "hdr", "bitdepth"]:
+        match = PATTERNS[key].search(name)
+        if match:
+            info[key] = match.group(1)
+
+    # Source detection - prefer REMUX over BluRay
+    if re.search(r"REMUX", name, re.IGNORECASE):
+        info["source"] = "REMUX"
+    else:
+        source_match = PATTERNS["source"].search(name)
+        if source_match:
+            info["source"] = source_match.group(1)
+
+    # Audio with channels
+    audio_match = PATTERNS["audio"].search(name)
+    if audio_match:
+        audio = audio_match.group(1)
+        # Normalize audio codec names
+        audio_upper = audio.upper().replace(".", " ").replace("-", "-")
+        if "DTS" in audio_upper and "HD" in audio_upper and "MA" in audio_upper:
+            audio = "DTS-HD MA"
+        elif "TRUEHD" in audio_upper and "ATMOS" in audio_upper:
+            audio = "TrueHD Atmos"
+        elif "TRUEHD" in audio_upper:
+            audio = "TrueHD"
+        elif "E-AC-3" in audio_upper or "EAC3" in audio_upper:
+            audio = "EAC3"
+        elif "DD+" in audio_upper:
+            audio = "DD+"
+        info["audio"] = audio
+        if audio_match.group(2):
+            info["audio_channels"] = audio_match.group(2)
+
+    # Normalize values
+    if info["resolution"]:
+        info["resolution"] = info["resolution"].lower().replace("4k", "2160p").replace("uhd", "2160p")
+    if info["codec"]:
+        codec = info["codec"].upper().replace(".", "")
+        if codec in ["X265", "H265"]:
+            info["codec"] = "HEVC"
+        elif codec in ["X264", "H264", "AVC"]:
+            info["codec"] = "H.264"
+        else:
+            info["codec"] = codec
+    if info["source"]:
+        info["source"] = info["source"].upper().replace("-", "").replace("BLURAY", "BluRay")
+    if info["bitdepth"]:
+        info["bitdepth"] = info["bitdepth"].lower().replace(" ", "").replace("-", "")  # "10bit"
+    if info["hdr"]:
+        hdr = info["hdr"].upper().replace(" ", "")
+        if hdr in ["DV", "DOVI", "DOLBYVISION"]:
+            info["hdr"] = "DV"
+        elif hdr == "HDR10+":
+            info["hdr"] = "HDR10+"
+        elif "HDR10" in hdr:
+            info["hdr"] = "HDR10"
+        elif "HDR" in hdr:
+            info["hdr"] = "HDR"
+
+    return info
+
+
+def clean_title(title):
+    """Clean up title string"""
+    # Replace dots and underscores with spaces
+    title = re.sub(r"[._]", " ", title)
+    # Remove extra whitespace
+    title = re.sub(r"\s+", " ", title)
+    # Remove trailing dashes/spaces
+    title = title.strip(" -")
+    return title
+
+
+# =============================================================================
+# TMDB Lookups
+# =============================================================================
+
+def search_tv(query, year=None):
+    """Search TMDB for TV shows"""
+    params = {"query": query}
+    if year:
+        params["first_air_date_year"] = year
+    return tmdb_request("/search/tv", params)
+
+
+def search_movie(query, year=None):
+    """Search TMDB for movies"""
+    params = {"query": query}
+    if year:
+        params["year"] = year
+    return tmdb_request("/search/movie", params)
+
+
+def get_tv_details(tv_id):
+    """Get TV show details"""
+    return tmdb_request(f"/tv/{tv_id}")
+
+
+def get_tv_episode(tv_id, season, episode):
+    """Get TV episode details"""
+    return tmdb_request(f"/tv/{tv_id}/season/{season}/episode/{episode}")
+
+
+def get_movie_details(movie_id):
+    """Get movie details"""
+    return tmdb_request(f"/movie/{movie_id}")
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_search(args):
+    """Search TMDB for a title"""
+    query = args.query
+
+    if args.movie:
+        results = search_movie(query, args.year)
+        media_type = "movie"
+    elif args.tv:
+        results = search_tv(query, args.year)
+        media_type = "tv"
+    else:
+        # Search both
+        tv_results = search_tv(query, args.year)
+        movie_results = search_movie(query, args.year)
+
+        print("=== TV Shows ===")
+        if tv_results and tv_results.get("results"):
+            for i, r in enumerate(tv_results["results"][:5], 1):
+                year = r.get("first_air_date", "")[:4]
+                print(f"  {i}. {r['name']} ({year}) [ID: {r['id']}]")
+        else:
+            print("  No results")
+
+        print("\n=== Movies ===")
+        if movie_results and movie_results.get("results"):
+            for i, r in enumerate(movie_results["results"][:5], 1):
+                year = r.get("release_date", "")[:4]
+                print(f"  {i}. {r['title']} ({year}) [ID: {r['id']}]")
+        else:
+            print("  No results")
+        return
+
+    if not results or not results.get("results"):
+        print("No results found")
+        return
+
+    for i, r in enumerate(results["results"][:10], 1):
+        if media_type == "tv":
+            year = r.get("first_air_date", "")[:4]
+            print(f"{i}. {r['name']} ({year}) [ID: {r['id']}]")
+        else:
+            year = r.get("release_date", "")[:4]
+            print(f"{i}. {r['title']} ({year}) [ID: {r['id']}]")
+
+
+def cmd_info(args):
+    """Show detected info for files"""
+    files = get_video_files(args.path)
+
+    if not files:
+        print("No video files found")
+        return
+
+    for f in files:
+        info = parse_filename(f.name)
+        print(f"\n{f.name}")
+        print("-" * 60)
+        print(f"  Type: {info['type']}")
+        print(f"  Title: {info['title']}")
+        if info["year"]:
+            print(f"  Year: {info['year']}")
+        if info["type"] == "tv":
+            ep_str = f"S{info['season']:02d}E{info['episode']:02d}"
+            if info["episode_end"]:
+                ep_str += f"-E{info['episode_end']:02d}"
+            print(f"  Episode: {ep_str}")
+        if info["resolution"]:
+            print(f"  Resolution: {info['resolution']}")
+        if info["source"]:
+            print(f"  Source: {info['source']}")
+        if info["codec"]:
+            print(f"  Codec: {info['codec']}")
+        if info["audio"]:
+            audio_str = info["audio"]
+            if info["audio_channels"]:
+                audio_str += f" {info['audio_channels']}"
+            print(f"  Audio: {audio_str}")
+        if info["hdr"]:
+            print(f"  HDR: {info['hdr']}")
+        if info["bitdepth"]:
+            print(f"  Bit Depth: {info['bitdepth']}")
+        if info["group"]:
+            print(f"  Group: {info['group']}")
+
+
+def cmd_rename(args):
+    """Rename files using TMDB metadata"""
+    config = load_config()
+    files = get_video_files(args.path)
+
+    if not files:
+        print("No video files found")
+        return
+
+    # Group files by detected show/movie
+    groups = {}
+    for f in files:
+        info = parse_filename(f.name)
+        key = (info["type"], info["title"].lower(), info.get("year"))
+        if key not in groups:
+            groups[key] = {"info": info, "files": []}
+        groups[key]["files"].append((f, info))
+
+    renames = []
+
+    for key, group in groups.items():
+        media_type, title, year = key
+
+        # Look up on TMDB
+        if media_type == "tv":
+            results = search_tv(group["info"]["title"], year)
+            if not results or not results.get("results"):
+                print(f"No TMDB match for TV: {group['info']['title']}")
+                continue
+
+            # Use first result or let user select
+            if args.interactive and len(results["results"]) > 1:
+                match = select_result(results["results"][:5], "tv")
+            else:
+                match = results["results"][0]
+
+            show_details = get_tv_details(match["id"])
+            show_name = show_details["name"]
+            show_year = show_details.get("first_air_date", "")[:4]
+
+            for f, info in group["files"]:
+                # Get episode title
+                ep_details = get_tv_episode(match["id"], info["season"], info["episode"])
+                ep_title = ep_details["name"] if ep_details else f"Episode {info['episode']}"
+
+                # Build new name
+                new_name = format_tv_name(
+                    show=show_name,
+                    year=show_year,
+                    season=info["season"],
+                    episode=info["episode"],
+                    episode_end=info.get("episode_end"),
+                    title=ep_title,
+                    info=info,
+                    pattern=args.pattern or config.get("tv_pattern", DEFAULT_TV_PATTERN)
+                )
+                new_name += f.suffix
+                renames.append((f, f.parent / new_name))
+
+        else:  # movie
+            results = search_movie(group["info"]["title"], year)
+            if not results or not results.get("results"):
+                print(f"No TMDB match for movie: {group['info']['title']}")
+                continue
+
+            if args.interactive and len(results["results"]) > 1:
+                match = select_result(results["results"][:5], "movie")
+            else:
+                match = results["results"][0]
+
+            movie_details = get_movie_details(match["id"])
+            movie_title = movie_details["title"]
+            movie_year = movie_details.get("release_date", "")[:4]
+
+            for f, info in group["files"]:
+                new_name = format_movie_name(
+                    title=movie_title,
+                    year=movie_year,
+                    info=info,
+                    pattern=args.pattern or config.get("movie_pattern", DEFAULT_MOVIE_PATTERN)
+                )
+                new_name += f.suffix
+                renames.append((f, f.parent / new_name))
+
+    if not renames:
+        print("No files to rename")
+        return
+
+    # Show preview
+    print("\n=== Rename Preview ===\n")
+    for old, new in renames:
+        print(f"  {old.name}")
+        print(f"  -> {new.name}\n")
+
+    if args.dry_run:
+        print("(Dry run - no changes made)")
+        return
+
+    # Confirm
+    if not args.yes:
+        response = input(f"Rename {len(renames)} files? [y/N] ")
+        if response.lower() != "y":
+            print("Cancelled")
+            return
+
+    # Execute renames
+    for old, new in renames:
+        try:
+            old.rename(new)
+            print(f"Renamed: {new.name}")
+        except Exception as e:
+            print(f"Error renaming {old.name}: {e}", file=sys.stderr)
+
+
+def cmd_organize(args):
+    """Organize files into TV/Movie folder structure"""
+    config = load_config()
+    files = get_video_files(args.path)
+
+    if not files:
+        print("No video files found")
+        return
+
+    tv_folder = Path(args.tv_folder or config.get("tv_folder", "~/TV Shows")).expanduser()
+    movie_folder = Path(args.movie_folder or config.get("movie_folder", "~/Movies")).expanduser()
+
+    moves = []
+
+    for f in files:
+        info = parse_filename(f.name)
+
+        if info["type"] == "tv":
+            # Look up show
+            results = search_tv(info["title"], info.get("year"))
+            if results and results.get("results"):
+                show = results["results"][0]
+                show_details = get_tv_details(show["id"])
+                show_name = sanitize_filename(show_details["name"])
+                show_year = show_details.get("first_air_date", "")[:4]
+
+                if show_year:
+                    folder_name = f"{show_name} ({show_year})"
+                else:
+                    folder_name = show_name
+
+                season_folder = f"Season {info['season']:02d}"
+                dest = tv_folder / folder_name / season_folder / f.name
+            else:
+                print(f"No match for: {f.name}")
+                continue
+        else:
+            # Look up movie
+            results = search_movie(info["title"], info.get("year"))
+            if results and results.get("results"):
+                movie = results["results"][0]
+                movie_details = get_movie_details(movie["id"])
+                movie_title = sanitize_filename(movie_details["title"])
+                movie_year = movie_details.get("release_date", "")[:4]
+
+                if movie_year:
+                    folder_name = f"{movie_title} ({movie_year})"
+                else:
+                    folder_name = movie_title
+
+                dest = movie_folder / folder_name / f.name
+            else:
+                print(f"No match for: {f.name}")
+                continue
+
+        moves.append((f, dest))
+
+    if not moves:
+        print("No files to organize")
+        return
+
+    # Show preview
+    print("\n=== Organize Preview ===\n")
+    for old, new in moves:
+        print(f"  {old}")
+        print(f"  -> {new}\n")
+
+    if args.dry_run:
+        print("(Dry run - no changes made)")
+        return
+
+    # Confirm
+    if not args.yes:
+        response = input(f"Move {len(moves)} files? [y/N] ")
+        if response.lower() != "y":
+            print("Cancelled")
+            return
+
+    # Execute moves
+    for old, new in moves:
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.rename(new)
+            print(f"Moved: {new.name}")
+        except Exception as e:
+            print(f"Error moving {old.name}: {e}", file=sys.stderr)
+
+
+def cmd_config(args):
+    """Show or set config"""
+    config = load_config()
+
+    if args.set:
+        key, value = args.set.split("=", 1)
+        config[key] = value
+        save_config(config)
+        print(f"Set {key} = {value}")
+    else:
+        if not config:
+            print(f"No config file found at {CONFIG_PATH}")
+            print("\nCreate config with:")
+            print('  media config --set tmdb_api_key=YOUR_KEY')
+            print("\nGet free TMDB API key at:")
+            print("  https://www.themoviedb.org/settings/api")
+        else:
+            print(f"Config: {CONFIG_PATH}\n")
+            for k, v in config.items():
+                if "key" in k.lower():
+                    v = v[:8] + "..." if len(v) > 8 else v
+                print(f"  {k}: {v}")
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def get_video_files(path):
+    """Get video files from path"""
+    p = Path(path).expanduser()
+    if p.is_file():
+        if p.suffix.lower() in VIDEO_EXTENSIONS:
+            return [p]
+        return []
+    elif p.is_dir():
+        files = []
+        for ext in VIDEO_EXTENSIONS:
+            files.extend(p.glob(f"*{ext}"))
+            files.extend(p.glob(f"*{ext.upper()}"))
+        return sorted(files)
+    return []
+
+
+def sanitize_filename(name):
+    """Remove invalid filename characters"""
+    # Replace invalid chars with space
+    name = re.sub(r'[<>:"/\\|?*]', " ", name)
+    # Collapse multiple spaces
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+def format_tv_name(show, year, season, episode, episode_end, title, info, pattern):
+    """Format TV episode filename using Sonarr-style format"""
+    # Build tech suffix in Sonarr order:
+    # [Quality Full][HDR][Audio Channels][Codec][BitDepth]-Group
+    tech_parts = []
+
+    # 1. Quality Full (source + resolution)
+    # For REMUX, format as "Bluray-1080p REMUX"
+    if info.get("source") == "REMUX":
+        if info.get("resolution"):
+            tech_parts.append(f"Bluray-{info['resolution']} REMUX")
+        else:
+            tech_parts.append("Bluray REMUX")
+    elif info.get("source"):
+        source = info["source"]
+        if info.get("resolution"):
+            tech_parts.append(f"{source}-{info['resolution']}")
+        else:
+            tech_parts.append(source)
+    elif info.get("resolution"):
+        tech_parts.append(info["resolution"])
+
+    # 2. HDR type (optional)
+    if info.get("hdr"):
+        tech_parts.append(info["hdr"])
+
+    # 3. Audio codec + channels
+    if info.get("audio"):
+        audio = info["audio"]
+        if info.get("audio_channels"):
+            audio += f" {info['audio_channels']}"
+        tech_parts.append(audio)
+
+    # 4. Video codec
+    if info.get("codec"):
+        tech_parts.append(info["codec"])
+
+    # 5. Bit depth (optional)
+    if info.get("bitdepth"):
+        tech_parts.append(info["bitdepth"])
+
+    tech_suffix = ""
+    if tech_parts:
+        tech_suffix = "[" + "][".join(tech_parts) + "]"
+
+    group_suffix = ""
+    if info.get("group"):
+        group_suffix = f"-{info['group']}"
+
+    # Format episode string
+    if episode_end:
+        ep_str = f"E{episode:02d}-E{episode_end:02d}"
+    else:
+        ep_str = f"E{episode:02d}"
+
+    # Apply pattern
+    name = pattern.format(
+        show=sanitize_filename(show),
+        year=year,
+        season=season,
+        episode=episode,
+        title=sanitize_filename(title),
+    )
+
+    # Handle multi-episode
+    if episode_end:
+        name = re.sub(r"E\d{2}", ep_str, name)
+
+    return f"{name} {tech_suffix}{group_suffix}".strip()
+
+
+def format_movie_name(title, year, info, pattern):
+    """Format movie filename using Sonarr-style format"""
+    # Build tech suffix in Sonarr order:
+    # [Quality Full][HDR][Audio Channels][Codec][BitDepth]-Group
+    tech_parts = []
+
+    # 1. Quality Full (source + resolution)
+    # For REMUX, format as "Bluray-1080p REMUX"
+    if info.get("source") == "REMUX":
+        if info.get("resolution"):
+            tech_parts.append(f"Bluray-{info['resolution']} REMUX")
+        else:
+            tech_parts.append("Bluray REMUX")
+    elif info.get("source"):
+        source = info["source"]
+        if info.get("resolution"):
+            tech_parts.append(f"{source}-{info['resolution']}")
+        else:
+            tech_parts.append(source)
+    elif info.get("resolution"):
+        tech_parts.append(info["resolution"])
+
+    # 2. HDR type (optional)
+    if info.get("hdr"):
+        tech_parts.append(info["hdr"])
+
+    # 3. Audio codec + channels
+    if info.get("audio"):
+        audio = info["audio"]
+        if info.get("audio_channels"):
+            audio += f" {info['audio_channels']}"
+        tech_parts.append(audio)
+
+    # 4. Video codec
+    if info.get("codec"):
+        tech_parts.append(info["codec"])
+
+    # 5. Bit depth (optional)
+    if info.get("bitdepth"):
+        tech_parts.append(info["bitdepth"])
+
+    tech_suffix = ""
+    if tech_parts:
+        tech_suffix = "[" + "][".join(tech_parts) + "]"
+
+    group_suffix = ""
+    if info.get("group"):
+        group_suffix = f"-{info['group']}"
+
+    name = pattern.format(
+        title=sanitize_filename(title),
+        year=year,
+    )
+
+    return f"{name} {tech_suffix}{group_suffix}".strip()
+
+
+def select_result(results, media_type):
+    """Interactive result selection"""
+    print("\nMultiple matches found:")
+    for i, r in enumerate(results, 1):
+        if media_type == "tv":
+            year = r.get("first_air_date", "")[:4]
+            print(f"  {i}. {r['name']} ({year})")
+        else:
+            year = r.get("release_date", "")[:4]
+            print(f"  {i}. {r['title']} ({year})")
+
+    while True:
+        try:
+            choice = input("Select [1]: ").strip() or "1"
+            idx = int(choice) - 1
+            if 0 <= idx < len(results):
+                return results[idx]
+        except ValueError:
+            pass
+        print("Invalid selection")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MediaCLI - Rename and organize media files using TMDB",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  media search "Breaking Bad"          Search TMDB
+  media info ~/Downloads/*.mkv         Show detected info
+  media rename ~/Downloads/ --dry-run  Preview renames
+  media rename ~/Downloads/ -y         Rename without confirm
+  media organize ~/Downloads/          Move to TV/Movie folders
+
+Config: ~/.config/mediacli/config.json
+  {
+    "tmdb_api_key": "your-api-key",
+    "tv_pattern": "{show} ({year}) - S{season:02d}E{episode:02d} - {title}",
+    "movie_pattern": "{title} ({year})",
+    "tv_folder": "~/TV Shows",
+    "movie_folder": "~/Movies"
+  }
+
+Get free TMDB API key at: https://www.themoviedb.org/settings/api
+"""
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # search
+    p_search = subparsers.add_parser("search", help="Search TMDB for title")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("--tv", "-t", action="store_true", help="Search TV only")
+    p_search.add_argument("--movie", "-m", action="store_true", help="Search movies only")
+    p_search.add_argument("--year", "-y", type=int, help="Filter by year")
+
+    # info
+    p_info = subparsers.add_parser("info", help="Show detected info for files")
+    p_info.add_argument("path", help="File or directory to analyze")
+
+    # rename
+    p_rename = subparsers.add_parser("rename", help="Rename files using TMDB")
+    p_rename.add_argument("path", help="File or directory to rename")
+    p_rename.add_argument("--dry-run", "-n", action="store_true", help="Preview only")
+    p_rename.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_rename.add_argument("--pattern", "-p", help="Custom naming pattern")
+    p_rename.add_argument("--interactive", "-i", action="store_true", help="Select matches interactively")
+
+    # organize
+    p_org = subparsers.add_parser("organize", help="Organize into folders")
+    p_org.add_argument("path", help="File or directory to organize")
+    p_org.add_argument("--dry-run", "-n", action="store_true", help="Preview only")
+    p_org.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_org.add_argument("--tv-folder", help="TV shows destination")
+    p_org.add_argument("--movie-folder", help="Movies destination")
+
+    # config
+    p_config = subparsers.add_parser("config", help="Show/set configuration")
+    p_config.add_argument("--set", "-s", metavar="KEY=VALUE", help="Set config value")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    commands = {
+        "search": cmd_search,
+        "info": cmd_info,
+        "rename": cmd_rename,
+        "organize": cmd_organize,
+        "config": cmd_config,
+    }
+
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
