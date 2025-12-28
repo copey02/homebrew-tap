@@ -3,7 +3,7 @@ class Trtcli < Formula
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/trtcli"
   version "1.1.1"
-  sha256 "0269ab3abb6f9dcd0a4a8157fb331a67c150699639e060cfc3c8bb785d3291ef"
+  sha256 "7ee16e5516284a2228f14bf0a5ec1812bed530510ee734f52add74885f476a84"
   license "MIT"
 
   depends_on "python@3"

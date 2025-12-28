@@ -3,7 +3,7 @@ class Tkcli < Formula
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/tkcli"
   version "1.3.3"
-  sha256 "fe867adf0625a4e22d6027397c72a6a2e201aafe264c5267b24d83f38ad60ef6"
+  sha256 "34f40734941420537ccf22ffc92de0c671d13c2740d33c422365244ec0e320b3"
   license "MIT"
 
   depends_on "python@3"
