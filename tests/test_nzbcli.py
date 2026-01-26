@@ -117,5 +117,22 @@ class UrlDetectionTests(unittest.TestCase):
         self.assertFalse(nzbcli.is_url("not-a-url"))
 
 
+class DefaultResolutionTests(unittest.TestCase):
+    def test_default_resolution_disabled(self):
+        config = {"default_resolution": "1080p"}
+        query = nzbcli.apply_default_resolution("Fringe S01E01", config, False)
+        self.assertEqual(query, "Fringe S01E01")
+
+    def test_default_resolution_enabled_adds(self):
+        config = {"default_resolution": "1080p"}
+        query = nzbcli.apply_default_resolution("Fringe S01E01", config, True)
+        self.assertEqual(query, "Fringe S01E01 1080p")
+
+    def test_default_resolution_enabled_no_dup(self):
+        config = {"default_resolution": "1080p"}
+        query = nzbcli.apply_default_resolution("Fringe S01E01 1080p", config, True)
+        self.assertEqual(query, "Fringe S01E01 1080p")
+
+
 if __name__ == "__main__":
     unittest.main()
