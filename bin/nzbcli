@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NZBgeek CLI - Search and download NZBs from NZBgeek
+NZB CLI - Search and download NZBs via NZBgeek or Prowlarr
 """
 
 import argparse
@@ -14,15 +14,9 @@ import urllib.parse
 import urllib.error
 from pathlib import Path
 
-CONFIG_PATH = Path(os.environ.get(
-    "NZBCLI_CONFIG_PATH",
-    str(Path.home() / ".config" / "nzbgeek" / "config.json")
-))
-SAB_CONFIG_PATH = Path(os.environ.get(
-    "SAB_CONFIG_PATH",
-    str(Path.home() / ".config" / "sabnzbd" / "config.json")
-))
-VERSION = "1.1.2"
+DEFAULT_CONFIG_PATH = Path.home() / ".config" / "nzbgeek" / "config.json"
+DEFAULT_SAB_CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
+VERSION = "1.2.0"
 USER_AGENT = f"NZBCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 # NZBgeek categories
@@ -36,13 +30,14 @@ CATEGORIES = {
 }
 
 def load_config():
+    config_path = Path(os.environ.get("NZBCLI_CONFIG_PATH", str(DEFAULT_CONFIG_PATH)))
     config = {}
-    if CONFIG_PATH.exists():
+    if config_path.exists():
         try:
-            with open(CONFIG_PATH) as f:
+            with open(config_path) as f:
                 config = json.load(f)
         except json.JSONDecodeError:
-            print(f"Error: invalid JSON in {CONFIG_PATH}", file=sys.stderr)
+            print(f"Error: invalid JSON in {config_path}", file=sys.stderr)
             sys.exit(1)
         except OSError as e:
             print(f"Error reading config: {e}", file=sys.stderr)
@@ -50,20 +45,26 @@ def load_config():
 
     env_api_key = os.getenv("NZBCLI_API_KEY")
     env_api_url = os.getenv("NZBCLI_API_URL")
+    env_prowlarr_url = os.getenv("NZBCLI_PROWLARR_URL")
+    env_prowlarr_key = os.getenv("NZBCLI_PROWLARR_API_KEY")
     env_download = os.getenv("NZBCLI_DEFAULT_DOWNLOAD_PATH")
     env_res = os.getenv("NZBCLI_DEFAULT_RESOLUTION")
     if env_api_key:
         config["api_key"] = env_api_key
     if env_api_url:
         config["api_url"] = env_api_url
+    if env_prowlarr_url:
+        config["prowlarr_url"] = env_prowlarr_url
+    if env_prowlarr_key:
+        config["prowlarr_api_key"] = env_prowlarr_key
     if env_download:
         config["default_download_path"] = env_download
     if env_res:
         config["default_resolution"] = env_res
 
-    if not config.get("api_key") or not config.get("api_url"):
-        print(f"Error: Config missing api_key/api_url at {CONFIG_PATH}", file=sys.stderr)
-        print("Create it with: api_key, api_url, default_download_path, default_resolution", file=sys.stderr)
+    if not has_nzbgeek_config(config) and not has_prowlarr_config(config):
+        print(f"Error: Config missing NZBgeek or Prowlarr settings at {config_path}", file=sys.stderr)
+        print("Add either api_key/api_url or prowlarr_api_key/prowlarr_url", file=sys.stderr)
         sys.exit(1)
 
     return config
@@ -94,15 +95,64 @@ def request_json(url, headers=None, retries=3):
             print(f"API Error: {e}", file=sys.stderr)
             sys.exit(1)
 
+
+def has_nzbgeek_config(config):
+    return bool(config.get("api_key") and config.get("api_url"))
+
+
+def has_prowlarr_config(config):
+    return bool(config.get("prowlarr_api_key") and config.get("prowlarr_url"))
+
+
+def use_prowlarr(args, config):
+    if getattr(args, "nzbgeek", False):
+        return False
+    return has_prowlarr_config(config)
+
 def api_request(endpoint, params, config):
     params["apikey"] = config["api_key"]
     params["o"] = "json"
     url = f"{config['api_url']}?{urllib.parse.urlencode(params)}"
     return request_json(url)
 
+
+def prowlarr_request(params, config):
+    base_url = config["prowlarr_url"].rstrip("/")
+    query = urllib.parse.urlencode(params, doseq=True)
+    url = f"{base_url}/api/v1/search?{query}"
+    headers = {"X-Api-Key": config["prowlarr_api_key"]}
+    return request_json(url, headers=headers)
+
 def format_size(bytes_val):
+    try:
+        bytes_val = int(bytes_val)
+    except (TypeError, ValueError):
+        bytes_val = 0
     gb = int(bytes_val) / 1024 / 1024 / 1024
     return f"{gb:.1f} GB"
+
+
+def format_date(date_str):
+    if not date_str:
+        return ""
+    return str(date_str)[:10]
+
+
+def parse_prowlarr_items(releases):
+    items = []
+    for release in releases:
+        size_bytes = release.get("size", 0)
+        entry = {
+            "title": release.get("title", ""),
+            "size_bytes": size_bytes,
+            "size": format_size(size_bytes),
+            "date": format_date(release.get("publish_date") or release.get("publishDate")),
+            "guid": release.get("guid", ""),
+            "download_url": release.get("download_url") or release.get("downloadUrl", ""),
+            "indexer": release.get("indexer", ""),
+        }
+        items.append(entry)
+    return items
 
 def sanitize_filename(name, default="download"):
     base = Path(str(name)).name
@@ -110,14 +160,21 @@ def sanitize_filename(name, default="download"):
     base = re.sub(r"\s+", " ", base).strip().strip(". ")
     return base if base else default
 
+
+def is_url(value):
+    if not value:
+        return False
+    return value.startswith("http://") or value.startswith("https://")
+
 def load_sab_config():
+    config_path = Path(os.environ.get("SAB_CONFIG_PATH", str(DEFAULT_SAB_CONFIG_PATH)))
     config = {}
-    if SAB_CONFIG_PATH.exists():
+    if config_path.exists():
         try:
-            with open(SAB_CONFIG_PATH) as f:
+            with open(config_path) as f:
                 config = json.load(f)
         except json.JSONDecodeError:
-            print(f"Error: invalid JSON in {SAB_CONFIG_PATH}", file=sys.stderr)
+            print(f"Error: invalid JSON in {config_path}", file=sys.stderr)
             return None
         except OSError as e:
             print(f"Error reading SAB config: {e}", file=sys.stderr)
@@ -165,11 +222,20 @@ def search(args, config):
     if args.page and args.offset == 0:
         offset = max(args.page - 1, 0) * args.limit
 
-    params = {"t": "search", "q": query, "limit": args.limit}
-
-    if args.cat:
-        cat = CATEGORIES.get(args.cat, args.cat)
-        params["cat"] = cat
+    use_prowlarr_search = use_prowlarr(args, config)
+    if use_prowlarr_search:
+        params = {"query": query, "type": "search", "limit": args.limit}
+        if args.cat:
+            cat = CATEGORIES.get(args.cat, args.cat)
+            try:
+                params["categories"] = [int(c) for c in str(cat).split(",")]
+            except ValueError:
+                params["categories"] = []
+    else:
+        params = {"t": "search", "q": query, "limit": args.limit}
+        if args.cat:
+            cat = CATEGORIES.get(args.cat, args.cat)
+            params["cat"] = cat
 
     # Load SAB config if adding to SABnzbd
     sab_config = None
@@ -188,15 +254,19 @@ def search(args, config):
         params["offset"] = offset
 
     while True:
-        data = api_request("", params, config)
-
-        response = data.get("channel", {}).get("response", {}).get("@attributes", {})
-        total = int(response.get("total", total))
-        offset = int(response.get("offset", offset))
-
-        items = data.get("channel", {}).get("item", [])
-        if isinstance(items, dict):
-            items = [items]
+        if use_prowlarr_search:
+            data = prowlarr_request(params, config)
+            items = parse_prowlarr_items(data)
+            if not total:
+                total = max(total, len(items) + offset)
+        else:
+            data = api_request("", params, config)
+            response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+            total = int(response.get("total", total))
+            offset = int(response.get("offset", offset))
+            items = data.get("channel", {}).get("item", [])
+            if isinstance(items, dict):
+                items = [items]
 
         if not items and not all_items:
             if args.json:
@@ -213,21 +283,32 @@ def search(args, config):
 
         page_items = []
         for item in items:
-            title = item.get("title", "")
-            size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
-            size = format_size(size_bytes)
-            date = item.get("pubDate", "")[:12]
+            if use_prowlarr_search:
+                title = item.get("title", "")
+                size_bytes = item.get("size_bytes", 0)
+                size = item.get("size", format_size(size_bytes))
+                date = item.get("date", "")
+                guid = item.get("guid", "")
+                download_url = item.get("download_url", "")
+                indexer = item.get("indexer", "")
+            else:
+                title = item.get("title", "")
+                size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
+                size = format_size(size_bytes)
+                date = item.get("pubDate", "")[:12]
 
-            attrs = item.get("attr", [])
-            if isinstance(attrs, dict):
-                attrs = [attrs]
-            elif attrs is None:
-                attrs = []
-            guid = ""
-            for attr in attrs:
-                if attr.get("@attributes", {}).get("name") == "guid":
-                    guid = attr.get("@attributes", {}).get("value", "")
-                    break
+                attrs = item.get("attr", [])
+                if isinstance(attrs, dict):
+                    attrs = [attrs]
+                elif attrs is None:
+                    attrs = []
+                guid = ""
+                for attr in attrs:
+                    if attr.get("@attributes", {}).get("name") == "guid":
+                        guid = attr.get("@attributes", {}).get("value", "")
+                        break
+                download_url = ""
+                indexer = ""
 
             entry = {
                 "title": title,
@@ -235,34 +316,52 @@ def search(args, config):
                 "size": size,
                 "date": date,
                 "guid": guid,
+                "download_url": download_url,
+                "indexer": indexer,
             }
             page_items.append(entry)
 
-            if args.add_to_sab and guid:
-                nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
-                if add_to_sabnzbd(nzb_url, sab_config, title):
-                    if not args.json:
-                        print(f"Added: {title[:70]}")
-                    added_count += 1
-                else:
-                    if not args.json:
+            if args.add_to_sab:
+                if use_prowlarr_search:
+                    if download_url and add_to_sabnzbd(download_url, sab_config, title):
+                        if not args.json:
+                            print(f"Added: {title[:70]}")
+                        added_count += 1
+                    elif not args.json:
                         print(f"Failed: {title[:70]}")
+                elif guid:
+                    nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+                    if add_to_sabnzbd(nzb_url, sab_config, title):
+                        if not args.json:
+                            print(f"Added: {title[:70]}")
+                        added_count += 1
+                    else:
+                        if not args.json:
+                            print(f"Failed: {title[:70]}")
             elif not args.json:
                 if not all_items:
                     print(f"\n{'Title':<80} {'Size':>10} {'Date':<12}")
                     print("-" * 105)
                 print(f"{title[:79]:<80} {size:>10} {date:<12}")
                 if args.show_guid:
-                    print(f"  GUID: {guid}")
+                    label = "URL" if use_prowlarr_search else "GUID"
+                    value = download_url if use_prowlarr_search else guid
+                    print(f"  {label}: {value}")
 
         all_items.extend(page_items)
 
         if not args.all:
             break
-        if offset + len(items) >= total:
-            break
-        offset += args.limit
-        params["offset"] = offset
+        if use_prowlarr_search:
+            if len(items) < args.limit:
+                break
+            offset += args.limit
+            params["offset"] = offset
+        else:
+            if offset + len(items) >= total:
+                break
+            offset += args.limit
+            params["offset"] = offset
 
     if args.add_to_sab:
         if args.json:
@@ -314,7 +413,13 @@ def get(args, config):
 
     success_count = 0
     for guid in guids:
-        url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+        if is_url(guid):
+            url = guid
+        elif has_nzbgeek_config(config):
+            url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+        else:
+            print("Error: NZBgeek config required to download by GUID", file=sys.stderr)
+            sys.exit(1)
 
         if args.add_to_sab:
             # Direct to SABnzbd - get title first
@@ -384,11 +489,20 @@ def recent(args, config):
     if args.page and args.offset == 0:
         offset = max(args.page - 1, 0) * args.limit
 
-    params = {"t": "search", "q": query, "limit": args.limit}
-
-    if args.cat:
-        cat = CATEGORIES.get(args.cat, args.cat)
-        params["cat"] = cat
+    use_prowlarr_search = use_prowlarr(args, config)
+    if use_prowlarr_search:
+        params = {"query": query, "type": "search", "limit": args.limit}
+        if args.cat:
+            cat = CATEGORIES.get(args.cat, args.cat)
+            try:
+                params["categories"] = [int(c) for c in str(cat).split(",")]
+            except ValueError:
+                params["categories"] = []
+    else:
+        params = {"t": "search", "q": query, "limit": args.limit}
+        if args.cat:
+            cat = CATEGORIES.get(args.cat, args.cat)
+            params["cat"] = cat
 
     # Load SAB config if adding to SABnzbd
     sab_config = None
@@ -408,16 +522,19 @@ def recent(args, config):
         params["offset"] = offset
 
     while True:
-        data = api_request("", params, config)
-
-        # Get total from response
-        response = data.get("channel", {}).get("response", {}).get("@attributes", {})
-        total = int(response.get("total", total))
-        offset = int(response.get("offset", offset))
-
-        items = data.get("channel", {}).get("item", [])
-        if isinstance(items, dict):
-            items = [items]
+        if use_prowlarr_search:
+            data = prowlarr_request(params, config)
+            items = parse_prowlarr_items(data)
+            if not total:
+                total = max(total, len(items) + offset)
+        else:
+            data = api_request("", params, config)
+            response = data.get("channel", {}).get("response", {}).get("@attributes", {})
+            total = int(response.get("total", total))
+            offset = int(response.get("offset", offset))
+            items = data.get("channel", {}).get("item", [])
+            if isinstance(items, dict):
+                items = [items]
 
         if not items and not all_items:
             if args.json:
@@ -434,30 +551,41 @@ def recent(args, config):
 
         page_items = []
         for item in items:
-            title = item.get("title", "")
-            size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
-            size = format_size(size_bytes)
-            date = item.get("pubDate", "")[:12]
+            if use_prowlarr_search:
+                title = item.get("title", "")
+                size_bytes = item.get("size_bytes", 0)
+                size = item.get("size", format_size(size_bytes))
+                date = item.get("date", "")
+                guid = item.get("guid", "")
+                download_url = item.get("download_url", "")
+                indexer = item.get("indexer", "")
+            else:
+                title = item.get("title", "")
+                size_bytes = item.get("enclosure", {}).get("@attributes", {}).get("length", 0)
+                size = format_size(size_bytes)
+                date = item.get("pubDate", "")[:12]
 
-            # For TV, dedupe by show name
-            if args.cat == "tv":
-                match = re.match(r'(.+?)\.(S\d{2})', title)
-                if match:
-                    show = match.group(1)
-                    if show in seen:
-                        continue
-                    seen.add(show)
+                # For TV, dedupe by show name
+                if args.cat == "tv":
+                    match = re.match(r'(.+?)\.(S\d{2})', title)
+                    if match:
+                        show = match.group(1)
+                        if show in seen:
+                            continue
+                        seen.add(show)
 
-            attrs = item.get("attr", [])
-            if isinstance(attrs, dict):
-                attrs = [attrs]
-            elif attrs is None:
-                attrs = []
-            guid = ""
-            for attr in attrs:
-                if attr.get("@attributes", {}).get("name") == "guid":
-                    guid = attr.get("@attributes", {}).get("value", "")
-                    break
+                attrs = item.get("attr", [])
+                if isinstance(attrs, dict):
+                    attrs = [attrs]
+                elif attrs is None:
+                    attrs = []
+                guid = ""
+                for attr in attrs:
+                    if attr.get("@attributes", {}).get("name") == "guid":
+                        guid = attr.get("@attributes", {}).get("value", "")
+                        break
+                download_url = ""
+                indexer = ""
 
             entry = {
                 "title": title,
@@ -465,33 +593,51 @@ def recent(args, config):
                 "size": size,
                 "date": date,
                 "guid": guid,
+                "download_url": download_url,
+                "indexer": indexer,
             }
             page_items.append(entry)
 
-            if args.add_to_sab and guid:
-                nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
-                if add_to_sabnzbd(nzb_url, sab_config, title):
-                    if not args.json:
-                        print(f"Added: {title[:70]}")
-                    added_count += 1
-                elif not args.json:
-                    print(f"Failed: {title[:70]}")
+            if args.add_to_sab:
+                if use_prowlarr_search:
+                    if download_url and add_to_sabnzbd(download_url, sab_config, title):
+                        if not args.json:
+                            print(f"Added: {title[:70]}")
+                        added_count += 1
+                    elif not args.json:
+                        print(f"Failed: {title[:70]}")
+                elif guid:
+                    nzb_url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+                    if add_to_sabnzbd(nzb_url, sab_config, title):
+                        if not args.json:
+                            print(f"Added: {title[:70]}")
+                        added_count += 1
+                    elif not args.json:
+                        print(f"Failed: {title[:70]}")
             elif not args.json:
                 if not all_items:
                     print(f"\n{'Title':<75} {'Size':>10} {'Date':<12}")
                     print("-" * 100)
                 print(f"{title[:74]:<75} {size:>10} {date:<12}")
                 if args.show_guid:
-                    print(f"  GUID: {guid}")
+                    label = "URL" if use_prowlarr_search else "GUID"
+                    value = download_url if use_prowlarr_search else guid
+                    print(f"  {label}: {value}")
 
         all_items.extend(page_items)
 
         if not args.all:
             break
-        if offset + len(items) >= total:
-            break
-        offset += args.limit
-        params["offset"] = offset
+        if use_prowlarr_search:
+            if len(items) < args.limit:
+                break
+            offset += args.limit
+            params["offset"] = offset
+        else:
+            if offset + len(items) >= total:
+                break
+            offset += args.limit
+            params["offset"] = offset
 
     if args.add_to_sab:
         if args.json:
@@ -526,7 +672,7 @@ def recent(args, config):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="NZBgeek CLI - Search and download NZBs",
+        description="NZB CLI - Search and download NZBs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -535,12 +681,15 @@ Examples:
   nzb search "Dogma" --no-default-res       # Search without 1080p filter
   nzb search "Dogma" --offset 50            # Page 2 of results
   nzb search "Friends S07 Silence" -S       # Search and add ALL to SABnzbd
+  nzb search "Dogma" --nzbgeek              # Force NZBgeek search
   nzb get <guid>                            # Download NZB by GUID
+  nzb get <url>                             # Download NZB by URL
   nzb get <guid1> <guid2> <guid3>           # Download multiple NZBs
   nzb get <guid> -o ~/Downloads             # Download to specific folder
   nzb get <guid1> <guid2> -S                # Add multiple directly to SABnzbd
   nzb recent -g FraMeSToR -c movies         # Recent FraMeSToR movies
   nzb recent -g HONE -c tv                  # Recent HONE TV releases
+  nzb recent -g HONE -c tv --nzbgeek         # Force NZBgeek recent
 
 Categories: movies, movies-hd, tv, tv-hd (or numeric IDs)
 Default: 50 results per page, use --offset to paginate
@@ -553,7 +702,7 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Search command
-    search_p = subparsers.add_parser("search", aliases=["s"], help="Search NZBgeek")
+    search_p = subparsers.add_parser("search", aliases=["s"], help="Search NZBs")
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("-c", "--cat", help="Category (movies, tv, etc)")
     search_p.add_argument("-l", "--limit", type=int, default=50, help="Max results (default: 50)")
@@ -561,8 +710,9 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     search_p.add_argument("--all", action="store_true", help="Fetch all pages")
     search_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     search_p.add_argument("--no-default-res", action="store_true", help="Don't add default resolution to search")
-    search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs for downloading")
+    search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs/URLs for downloading")
     search_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
+    search_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
 
     # Get/download command
     get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download NZB by GUID(s)")
@@ -579,8 +729,9 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     recent_p.add_argument("--all", action="store_true", help="Fetch all pages")
     recent_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
     recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
-    recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs")
+    recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs/URLs")
     recent_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
+    recent_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
 
     args = parser.parse_args()
 

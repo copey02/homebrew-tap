@@ -82,12 +82,14 @@ trt watch                       # Monitor until complete
 
 ### nzbcli (nzb)
 
-NZBgeek CLI - Search and download NZBs from NZBgeek.
+NZB CLI - Search and download NZBs via NZBgeek or Prowlarr.
 
 ```bash
-nzb search "Movie Name"           # Search (1080p default)
+nzb search "Movie Name"           # Search (1080p default, Prowlarr if configured)
 nzb search "Show S01" -c tv       # Search TV
-nzb get <guid>                    # Download NZB
+nzb search "Show S01" --nzbgeek   # Force NZBgeek search
+nzb get <guid>                    # Download NZB by GUID
+nzb get <url>                     # Download NZB by URL
 nzb recent -g FraMeSToR -c movies # Recent releases
 ```
 
@@ -164,9 +166,21 @@ Note: password is only needed if Tidarr auth is enabled.
 {
   "api_key": "YOUR_NZBGEEK_API_KEY",
   "api_url": "https://api.nzbgeek.info/api",
+  "prowlarr_url": "http://localhost:9696",
+  "prowlarr_api_key": "YOUR_PROWLARR_API_KEY",
   "default_download_path": "~/Downloads",
   "default_resolution": "1080p"
 }
+```
+
+Environment overrides:
+```bash
+export NZBCLI_API_KEY="YOUR_NZBGEEK_API_KEY"
+export NZBCLI_API_URL="https://api.nzbgeek.info/api"
+export NZBCLI_PROWLARR_URL="http://localhost:9696"
+export NZBCLI_PROWLARR_API_KEY="YOUR_PROWLARR_API_KEY"
+export NZBCLI_DEFAULT_DOWNLOAD_PATH="~/Downloads"
+export NZBCLI_DEFAULT_RESOLUTION="1080p"
 ```
 
 **~/.config/sabnzbd/config.json**
