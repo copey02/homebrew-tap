@@ -85,10 +85,9 @@ trt watch                       # Monitor until complete
 NZB CLI - Search and download NZBs via NZBgeek or Prowlarr.
 
 ```bash
-nzb search "Movie Name"           # Search (Prowlarr if configured)
+nzb search "Movie Name"           # Search (1080p default, Prowlarr if configured)
 nzb search "Show S01" -c tv       # Search TV
 nzb search "Show S01" --nzbgeek   # Force NZBgeek search
-nzb search "Show S01" --default-res # Append default resolution
 nzb get <guid>                    # Download NZB by GUID
 nzb get <url>                     # Download NZB by URL
 nzb recent -g FraMeSToR -c movies # Recent releases

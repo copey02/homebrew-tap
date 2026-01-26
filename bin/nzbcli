@@ -16,7 +16,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "nzbgeek" / "config.json"
 DEFAULT_SAB_CONFIG_PATH = Path.home() / ".config" / "sabnzbd" / "config.json"
-VERSION = "1.2.1"
+VERSION = "1.2.0"
 USER_AGENT = f"NZBCLI/{VERSION} (+https://github.com/copey02/homebrew-tap)"
 
 # NZBgeek categories
@@ -132,15 +132,6 @@ def format_size(bytes_val):
     return f"{gb:.1f} GB"
 
 
-def apply_default_resolution(query, config, enabled):
-    if not enabled:
-        return query
-    res = config.get("default_resolution", "1080p")
-    if res.lower() in query.lower():
-        return query
-    return f"{query} {res}"
-
-
 def format_date(date_str):
     if not date_str:
         return ""
@@ -219,7 +210,13 @@ def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
         return False
 
 def search(args, config):
-    query = apply_default_resolution(args.query, config, args.default_res)
+    query = args.query
+
+    # Add default resolution unless --no-default-res or already specified
+    if not args.no_default_res:
+        res = config.get("default_resolution", "1080p")
+        if res.lower() not in query.lower():
+            query = f"{query} {res}"
 
     offset = args.offset
     if args.page and args.offset == 0:
@@ -483,7 +480,10 @@ def get(args, config):
             print(f"\nDownloaded {success_count}/{len(guids)} NZBs to {output_dir}")
 
 def recent(args, config):
-    query = apply_default_resolution(args.group or "", config, args.default_res).strip()
+    query = args.group or ""
+    res = config.get("default_resolution", "1080p")
+    if not args.no_default_res:
+        query = f"{query} {res}".strip()
 
     offset = args.offset
     if args.page and args.offset == 0:
@@ -676,9 +676,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  nzb search "Dogma FraMeSToR"              # Search movies
+  nzb search "Dogma FraMeSToR"              # Search movies (1080p default)
   nzb search "Slow Horses S04" -c tv        # Search TV
-  nzb search "Dogma" --default-res          # Add default resolution filter
+  nzb search "Dogma" --no-default-res       # Search without 1080p filter
   nzb search "Dogma" --offset 50            # Page 2 of results
   nzb search "Friends S07 Silence" -S       # Search and add ALL to SABnzbd
   nzb search "Dogma" --nzbgeek              # Force NZBgeek search
@@ -709,8 +709,7 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     search_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
     search_p.add_argument("--all", action="store_true", help="Fetch all pages")
     search_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
-    search_p.add_argument("--default-res", action="store_true", help="Add default resolution to search")
-    search_p.add_argument("--no-default-res", action="store_true", help="Deprecated (default behavior)")
+    search_p.add_argument("--no-default-res", action="store_true", help="Don't add default resolution to search")
     search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs/URLs for downloading")
     search_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
     search_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
@@ -729,8 +728,7 @@ Use -S/--add-to-sab to send NZBs directly to SABnzbd
     recent_p.add_argument("-p", "--page", type=int, default=1, help="Page number")
     recent_p.add_argument("--all", action="store_true", help="Fetch all pages")
     recent_p.add_argument("--offset", type=int, default=0, help="Result offset for pagination")
-    recent_p.add_argument("--default-res", action="store_true", help="Add default resolution to search")
-    recent_p.add_argument("--no-default-res", action="store_true", help="Deprecated (default behavior)")
+    recent_p.add_argument("--no-default-res", action="store_true", help="Don't filter by default resolution")
     recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs/URLs")
     recent_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
     recent_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
