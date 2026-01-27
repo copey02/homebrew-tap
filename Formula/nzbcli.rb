@@ -5,7 +5,6 @@ class Nzbcli < Formula
   version "1.6.0"
   sha256 "303a0b1e2d85145d044ac7f10a29060535a28ee913abf843419948cdda1e9c6e"
   license "MIT"
-  bottle :unneeded
 
   depends_on "python@3"
 
