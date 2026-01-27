@@ -418,9 +418,8 @@ def search(args, config):
                     print("-" * 105)
                 print(f"{title[:79]:<80} {size:>10} {date:<12}")
                 if args.show_guid:
-                    label = "URL" if use_prowlarr_search else "GUID"
-                    value = download_url if use_prowlarr_search else guid
-                    print(f"  {label}: {value}")
+                    value = guid or download_url
+                    print(f"  GUID: {value}")
 
         all_items.extend(page_items)
 
