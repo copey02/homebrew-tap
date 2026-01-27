@@ -2,8 +2,8 @@ class Nzbcli < Formula
   desc "NZB CLI - Search and download NZBs via NZBgeek or Prowlarr"
   homepage "https://github.com/copey02/homebrew-tap"
   url "https://raw.githubusercontent.com/copey02/homebrew-tap/main/bin/nzbcli"
-  version "1.3.0"
-  sha256 "22a61f25b671d30519c4aeff425fef5b7cd9a5d6be7b1e36303d2b22a0e1623e"
+  version "1.4.0"
+  sha256 "4432cd16437da32d16e7ea325f2efa3a8cbe788943a1309117460f9789eecb42"
   license "MIT"
 
   depends_on "python@3"
