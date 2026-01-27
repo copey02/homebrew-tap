@@ -487,13 +487,27 @@ def get(args, config):
 
     success_count = 0
     for guid in guids:
+        # Extract GUID from indexer URLs and construct proper download URL
+        actual_guid = guid
         if is_url(guid):
-            url = guid
-        elif has_nzbgeek_config(config):
-            url = f"{config['api_url']}?t=get&id={guid}&apikey={config['api_key']}"
+            # Check for NZBgeek-style URLs and extract GUID
+            guid_match = re.search(r'[?&]guid=([a-f0-9]+)', guid)
+            if guid_match:
+                actual_guid = guid_match.group(1)
+            # Check for other indexer URL patterns (e.g., /details/GUID)
+            elif '/details/' in guid:
+                actual_guid = guid.rstrip('/').split('/details/')[-1]
+
+        # Construct download URL with API key
+        if actual_guid != guid or not is_url(guid):
+            if has_nzbgeek_config(config):
+                url = f"{config['api_url']}?t=get&id={actual_guid}&apikey={config['api_key']}"
+            else:
+                print("Error: NZBgeek config required to download by GUID", file=sys.stderr)
+                sys.exit(1)
         else:
-            print("Error: NZBgeek config required to download by GUID", file=sys.stderr)
-            sys.exit(1)
+            # Unknown URL format, try as-is
+            url = guid
 
         if args.add_to_sab:
             # Download NZB and upload to SABnzbd
