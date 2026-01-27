@@ -150,9 +150,14 @@ def format_date(date_str):
     return str(date_str)[:10]
 
 
-def parse_prowlarr_items(releases):
+def parse_prowlarr_items(releases, usenet_only=True):
     items = []
     for release in releases:
+        # Filter by protocol if usenet_only is set
+        protocol = release.get("protocol", "").lower()
+        if usenet_only and protocol and protocol != "usenet":
+            continue
+
         size_bytes = release.get("size", 0)
         entry = {
             "title": release.get("title", ""),
@@ -162,6 +167,7 @@ def parse_prowlarr_items(releases):
             "guid": release.get("guid", ""),
             "download_url": release.get("download_url") or release.get("downloadUrl", ""),
             "indexer": release.get("indexer", ""),
+            "protocol": protocol,
         }
         items.append(entry)
     return items
@@ -265,13 +271,16 @@ def search(args, config):
     total = 0
     start_offset = offset
 
+    # Filter torrents by default when using Prowlarr
+    usenet_only = not getattr(args, 'include_torrents', False)
+
     if offset:
         params["offset"] = offset
 
     while True:
         if use_prowlarr_search:
             data = prowlarr_request(params, config)
-            items = parse_prowlarr_items(data)
+            items = parse_prowlarr_items(data, usenet_only=usenet_only)
             if not total:
                 total = max(total, len(items) + offset)
         else:
@@ -537,13 +546,16 @@ def recent(args, config):
     start_offset = offset
     seen = set()
 
+    # Filter torrents by default when using Prowlarr
+    usenet_only = not getattr(args, 'include_torrents', False)
+
     if offset:
         params["offset"] = offset
 
     while True:
         if use_prowlarr_search:
             data = prowlarr_request(params, config)
-            items = parse_prowlarr_items(data)
+            items = parse_prowlarr_items(data, usenet_only=usenet_only)
             if not total:
                 total = max(total, len(items) + offset)
         else:
@@ -735,6 +747,7 @@ Note: Audio categories auto-disable default resolution filter
     search_p.add_argument("-g", "--show-guid", action="store_true", help="Show GUIDs/URLs for downloading")
     search_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
     search_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
+    search_p.add_argument("--include-torrents", "-T", action="store_true", help="Include torrent results (Prowlarr only, default: usenet only)")
 
     # Get/download command
     get_p = subparsers.add_parser("get", aliases=["g", "download", "d"], help="Download NZB by GUID(s)")
@@ -754,6 +767,7 @@ Note: Audio categories auto-disable default resolution filter
     recent_p.add_argument("--show-guid", action="store_true", help="Show GUIDs/URLs")
     recent_p.add_argument("--add-to-sab", "-S", action="store_true", help="Add all results directly to SABnzbd")
     recent_p.add_argument("--nzbgeek", action="store_true", help="Force NZBgeek search")
+    recent_p.add_argument("--include-torrents", "-T", action="store_true", help="Include torrent results (Prowlarr only, default: usenet only)")
 
     args = parser.parse_args()
 
