@@ -27,6 +27,18 @@ CATEGORIES = {
     "tv": "5000",
     "tv-hd": "5040",
     "tv-sd": "5030",
+    # Audio categories
+    "audio": "3000",
+    "audio-mp3": "3010",
+    "audio-video": "3020",
+    "audio-audiobook": "3030",
+    "audio-flac": "3040",
+    "audio-pack": "3050",
+    "audio-other": "3060",
+    # Aliases for convenience
+    "music": "3000",
+    "music-mp3": "3010",
+    "music-flac": "3040",
 }
 
 def load_config():
@@ -212,8 +224,11 @@ def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
 def search(args, config):
     query = args.query
 
-    # Add default resolution unless --no-default-res or already specified
-    if not args.no_default_res:
+    # Disable default resolution for audio/music categories (resolution doesn't apply)
+    is_audio_search = args.cat and args.cat.startswith(("audio", "music"))
+
+    # Add default resolution unless --no-default-res, already specified, or audio search
+    if not args.no_default_res and not is_audio_search:
         res = config.get("default_resolution", "1080p")
         if res.lower() not in query.lower():
             query = f"{query} {res}"
@@ -481,8 +496,12 @@ def get(args, config):
 
 def recent(args, config):
     query = args.group or ""
+
+    # Disable default resolution for audio/music categories (resolution doesn't apply)
+    is_audio_search = args.cat and args.cat.startswith(("audio", "music"))
+
     res = config.get("default_resolution", "1080p")
-    if not args.no_default_res:
+    if not args.no_default_res and not is_audio_search:
         query = f"{query} {res}".strip()
 
     offset = args.offset
@@ -691,9 +710,12 @@ Examples:
   nzb recent -g HONE -c tv                  # Recent HONE TV releases
   nzb recent -g HONE -c tv --nzbgeek         # Force NZBgeek recent
 
-Categories: movies, movies-hd, tv, tv-hd (or numeric IDs)
+Categories:
+  Video: movies, movies-hd, tv, tv-hd (or numeric IDs)
+  Audio: audio, audio-flac, audio-mp3, music, music-flac, music-mp3
 Default: 50 results per page, use --offset to paginate
 Use -S/--add-to-sab to send NZBs directly to SABnzbd
+Note: Audio categories auto-disable default resolution filter
         """
     )
 
