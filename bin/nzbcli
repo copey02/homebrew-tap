@@ -227,6 +227,56 @@ def add_to_sabnzbd(nzb_url, sab_config, nzb_name=None):
     except SystemExit:
         return False
 
+
+def add_nzb_file_to_sabnzbd(nzb_path, sab_config, nzb_name=None):
+    """Upload NZB file directly to SABnzbd"""
+    import mimetypes
+
+    sab_url = sab_config["url"].rstrip("/")
+    api_url = f"{sab_url}/api"
+
+    # Read NZB content
+    with open(nzb_path, 'rb') as f:
+        nzb_content = f.read()
+
+    # Build multipart form data
+    boundary = '----NzbCliFormBoundary'
+
+    body_parts = []
+    # API key
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="apikey"\r\n\r\n{sab_config["api_key"]}\r\n')
+    # Mode
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="mode"\r\n\r\naddfile\r\n')
+    # Output format
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="output"\r\n\r\njson\r\n')
+    # NZB name if provided
+    if nzb_name:
+        body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="nzbname"\r\n\r\n{nzb_name}\r\n')
+
+    # Combine text parts
+    body = ''.join(body_parts).encode('utf-8')
+
+    # Add file part
+    filename = nzb_name + '.nzb' if nzb_name else 'upload.nzb'
+    file_header = f'--{boundary}\r\nContent-Disposition: form-data; name="nzbfile"; filename="{filename}"\r\nContent-Type: application/x-nzb\r\n\r\n'.encode('utf-8')
+    file_footer = f'\r\n--{boundary}--\r\n'.encode('utf-8')
+
+    full_body = body + file_header + nzb_content + file_footer
+
+    headers = {
+        'Content-Type': f'multipart/form-data; boundary={boundary}',
+        'Content-Length': str(len(full_body)),
+    }
+
+    req = urllib.request.Request(api_url, data=full_body, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            return result.get("status", False)
+    except Exception as e:
+        print(f"SABnzbd upload error: {e}", file=sys.stderr)
+        return False
+
 def search(args, config):
     query = args.query
 
@@ -446,7 +496,7 @@ def get(args, config):
             sys.exit(1)
 
         if args.add_to_sab:
-            # Direct to SABnzbd - get title first
+            # Download NZB and upload to SABnzbd
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".nzb") as tmp:
                     tmp_path = tmp.name
@@ -457,13 +507,14 @@ def get(args, config):
                     match = re.search(r'<meta type="name">([^<]+)</meta>', content)
                     if match:
                         title = match.group(1)
-                os.unlink(tmp_path)
 
-                if add_to_sabnzbd(url, sab_config, title):
+                # Upload NZB file directly to SABnzbd
+                if add_nzb_file_to_sabnzbd(tmp_path, sab_config, title):
                     print(f"Added: {title[:70]}")
                     success_count += 1
                 else:
                     print(f"Failed: {title[:70]}")
+                os.unlink(tmp_path)
             except Exception as e:
                 print(f"Error with {guid}: {e}")
         else:
